@@ -18,24 +18,24 @@ Project N.E.K.O. 的非官方 Tauri 桌面移植版（macOS 专用）。
 
 本项目基于开源的 [Project N.E.K.O.](https://github.com/Project-N-E-K-O/N.E-K.O) 进行开发，采用 **Tauri + React + TypeScript** 架构重构桌面端窗口与交互实现。
 
-> **免责声明**：本项目为社区维护的**非官方移植版（Unofficial Port）**，仅供学习与交流使用，与 Project N.E.K.O. 官方团队无任何隶属、授权或直接关联。
+> 免责声明：本项目为社区维护的 非官方移植版（Unofficial Port） ，仅供学习与交流使用，与 Project N.E.K.O. 官方团队无任何隶属、授权或直接关联。
 
 ---
 
 ## 移植特性
 
-* **轻量化桌面封装**：基于 Tauri 构建，优化桌面端资源占用与渲染开销。
-* **macOS 窗口穿透与置顶**：适配 macOS 桌面透明置顶、动态鼠标穿透与拖拽交互。
-* **双进程架构**：Python 后端驱动多模态交互，Tauri 负责原生桌面渲染。
+* 轻量化桌面封装：基于 Tauri 构建，优化桌面端资源占用与渲染开销。
+* macOS 窗口穿透与置顶：适配 macOS 桌面透明置顶、动态鼠标穿透与拖拽交互。
+* 双进程架构：Python 后端驱动多模态交互，Tauri 负责原生桌面渲染。
 
 ---
 
 ## 运行环境要求
 
-* **系统**：macOS
-* **Node.js** (>= 18)
-* **Python** (3.10+)
-* **Rust & Cargo** (最新稳定版)
+* 系统：macOS
+* Node.js (>= 18)
+* Python (3.10+)
+* Rust & Cargo (最新稳定版)
 
 ---
 
