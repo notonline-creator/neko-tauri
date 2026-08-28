@@ -1,0 +1,2473 @@
+# -- coding: utf-8 --
+
+import asyncio
+import websockets
+import json
+import base64
+import time
+import wave
+import numpy as np
+from pathlib import Path
+
+from typing import Optional, Callable, Dict, Any, Awaitable, List
+from enum import Enum
+from main_logic.tool_calling import (
+    OnToolCallCallback,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    parse_arguments_json,
+)
+from config import (
+    NATIVE_IMAGE_MIN_INTERVAL,
+    IMAGE_IDLE_RATE_MULTIPLIER,
+    OMNI_RECENT_RESPONSES_MAX,
+    OMNI_WS_FRAME_LIMIT_BYTES,
+    VISION_ANALYSIS_MAX_TOKENS,
+)
+from utils.config_manager import get_config_manager
+from utils.audio_processor import AudioProcessor
+from utils.file_utils import atomic_write_json
+from utils.frontend_utils import calculate_text_similarity
+from utils.logger_config import get_module_logger
+from utils.ssl_env_diagnostics import write_ssl_diagnostic
+
+# Gemini Live API SDK (startup-time import)
+try:
+    from google import genai
+    from google.genai import types
+    GEMINI_AVAILABLE = True
+    _GEMINI_IMPORT_ERROR = None
+except Exception as e:
+    GEMINI_AVAILABLE = False
+    _GEMINI_IMPORT_ERROR = e
+    genai = None
+    types = None
+
+# Setup logger for this module
+logger = get_module_logger(__name__, "Main")
+
+# ── Proactive audio prompt cache ──────────────────────────────────────
+_PROACTIVE_AUDIO_DIR = Path(__file__).resolve().parent.parent / "static" / "proactive_audio"
+_PROACTIVE_AUDIO_CACHE: Dict[str, bytes] = {}
+
+
+def _load_proactive_audio(filename: str) -> bytes:
+    """Load a proactive prompt WAV file as raw PCM16 bytes (cached).
+
+    Validates that the file is PCM16 mono 16 kHz before caching.
+    Raises ``ValueError`` on format mismatch, ``FileNotFoundError`` if absent.
+    """
+    if filename in _PROACTIVE_AUDIO_CACHE:
+        return _PROACTIVE_AUDIO_CACHE[filename]
+    path = _PROACTIVE_AUDIO_DIR / filename
+    with wave.open(str(path), "rb") as wf:
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000 or wf.getcomptype() != "NONE":
+            raise ValueError(
+                f"{filename}: expected PCM16 mono 16kHz, got "
+                f"ch={wf.getnchannels()} sw={wf.getsampwidth()} "
+                f"rate={wf.getframerate()} comp={wf.getcomptype()}"
+            )
+        data = wf.readframes(wf.getnframes())
+    _PROACTIVE_AUDIO_CACHE[filename] = data
+    return data
+
+
+class TurnDetectionMode(Enum):
+    SERVER_VAD = "server_vad"
+    MANUAL = "manual"
+
+_config_manager = get_config_manager()
+
+if not GEMINI_AVAILABLE and _GEMINI_IMPORT_ERROR is not None:
+    diagnostics_dir = Path(_config_manager.app_docs_dir) / "logs" / "diagnostics"
+    sentinel_path = diagnostics_dir / "gemini_sdk_import_failed.last.json"
+    throttle_window_seconds = 24 * 60 * 60
+    now_ts = time.time()
+
+    recent_diag_path = None
+    try:
+        if sentinel_path.exists():
+            with open(sentinel_path, "r", encoding="utf-8") as f:
+                sentinel_data = json.load(f)
+            sentinel_diag_path = sentinel_data.get("path")
+            sentinel_ts = float(sentinel_data.get("timestamp", 0))
+            if sentinel_diag_path and (now_ts - sentinel_ts) < throttle_window_seconds:
+                if Path(sentinel_diag_path).exists():
+                    recent_diag_path = sentinel_diag_path
+    except Exception as sentinel_err:
+        logger.error(f"Gemini diagnostic sentinel read failed: {sentinel_err}")
+
+    if recent_diag_path is None:
+        try:
+            if diagnostics_dir.exists():
+                for diag_file in diagnostics_dir.glob("ssl_diagnostic_*.json"):
+                    try:
+                        with open(diag_file, "r", encoding="utf-8") as f:
+                            payload = json.load(f)
+                        if payload.get("event") != "gemini_sdk_import_failed":
+                            continue
+                        file_mtime = diag_file.stat().st_mtime
+                        if (now_ts - file_mtime) < throttle_window_seconds:
+                            if (
+                                recent_diag_path is None
+                                or file_mtime > Path(recent_diag_path).stat().st_mtime
+                            ):
+                                recent_diag_path = str(diag_file)
+                    except Exception as diag_file_err:
+                        logger.debug(
+                            "Skipping diagnostic file scan due to parse/read error: %s (%s)",
+                            diag_file,
+                            diag_file_err,
+                        )
+                        continue
+        except Exception as scan_err:
+            logger.error(f"Gemini diagnostic scan failed: {scan_err}")
+
+    if recent_diag_path:
+        logger.warning(f"Gemini SDK import failed, recent diagnostic exists: {recent_diag_path}")
+    else:
+        try:
+            diag_path = write_ssl_diagnostic(
+                event="gemini_sdk_import_failed",
+                output_dir=str(diagnostics_dir),
+                error=_GEMINI_IMPORT_ERROR,
+                extra={"stage": "module_import"},
+            )
+            if diag_path:
+                logger.warning(f"Gemini SDK import failed, diagnostic saved: {diag_path}")
+                try:
+                    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                    atomic_write_json(
+                        sentinel_path,
+                        {
+                            "path": diag_path,
+                            "timestamp": now_ts,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                except Exception as sentinel_write_err:
+                    logger.error(f"Gemini diagnostic sentinel write failed: {sentinel_write_err}")
+        except Exception as diag_err:
+            logger.error(f"Gemini SDK diagnostic write failed: {diag_err}")
+
+
+class OmniRealtimeClient:
+    """
+    A demo client for interacting with the Omni Realtime API.
+
+    This class provides methods to connect to the Realtime API, send text and audio data,
+    handle responses, and manage the WebSocket connection.
+
+    Attributes:
+        base_url (str):
+            The base URL for the Realtime API.
+        api_key (str):
+            The API key for authentication.
+        model (str):
+            Omni model to use for chat.
+        voice (str):
+            The voice to use for audio output.
+        turn_detection_mode (TurnDetectionMode):
+            The mode for turn detection.
+        on_text_delta (Callable[[str, bool], Awaitable[None]]):
+            Callback for text delta events.
+            Takes in a string and returns an awaitable.
+        on_audio_delta (Callable[[bytes], Awaitable[None]]):
+            Callback for audio delta events.
+            Takes in bytes and returns an awaitable.
+        on_input_transcript (Callable[[str], Awaitable[None]]):
+            Callback for input transcript events.
+            Takes in a string and returns an awaitable.
+        on_interrupt (Callable[[], Awaitable[None]]):
+            Callback for user interrupt events, should be used to stop audio playback.
+        on_output_transcript (Callable[[str, bool], Awaitable[None]]):
+            Callback for output transcript events.
+            Takes in a string and returns an awaitable.
+        extra_event_handlers (Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]]):
+            Additional event handlers.
+            Is a mapping of event names to functions that process the event payload.
+    """
+    def __init__(
+        self,
+        base_url,
+        api_key: str,
+        model: str = "",
+        voice: str = None,
+        turn_detection_mode: TurnDetectionMode = TurnDetectionMode.SERVER_VAD,
+        on_text_delta: Optional[Callable[[str, bool], Awaitable[None]]] = None,
+        on_audio_delta: Optional[Callable[[bytes], Awaitable[None]]] = None,
+        on_new_message: Optional[Callable[[], Awaitable[None]]] = None,
+        on_input_transcript: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_output_transcript: Optional[Callable[[str, bool], Awaitable[None]]] = None,
+        on_connection_error: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_response_done: Optional[Callable[[], Awaitable[None]]] = None,
+        on_silence_timeout: Optional[Callable[[], Awaitable[None]]] = None,
+        on_status_message: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_repetition_detected: Optional[Callable[[], Awaitable[None]]] = None,
+        extra_event_handlers: Optional[Dict[str, Callable[[Dict[str, Any]], Awaitable[None]]]] = None,
+        api_type: Optional[str] = None,
+        on_tool_call: Optional[OnToolCallCallback] = None,
+        tool_definitions: Optional[List[ToolDefinition]] = None,
+        livestream_mode: bool = False,
+    ):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self._model_lower = model.lower() if model else ''
+        self.voice = voice
+        self.ws = None
+        self.instructions = None
+        self.on_text_delta = on_text_delta
+        self.on_audio_delta = on_audio_delta
+        self.on_new_message = on_new_message
+        self.on_input_transcript = on_input_transcript
+        self.on_output_transcript = on_output_transcript
+        self.turn_detection_mode = turn_detection_mode
+        self.on_connection_error = on_connection_error
+        self.on_response_done = on_response_done
+        self.on_silence_timeout = on_silence_timeout
+        self.on_status_message = on_status_message
+        self.on_repetition_detected = on_repetition_detected
+        self.extra_event_handlers = extra_event_handlers or {}
+        self._bg_tasks: set = set()  # 防止 fire-and-forget 任务被 GC 回收
+
+        # Track current response state
+        self._current_response_id = None
+        self._current_item_id = None
+        self._is_responding = False
+        # Track printing state for input and output transcripts
+        self._is_first_text_chunk = False
+        self._is_first_transcript_chunk = False
+        self._print_input_transcript = False
+        self._output_transcript_buffer = ""
+        self._modalities = ["text", "audio"]
+        self._audio_in_buffer = False
+        self._skip_until_next_response = False
+        self._audio_delta_count = 0  # diagnostic: count audio.delta events per session
+        self._audio_delta_total = 0  # monotonic diagnostic across responses
+        self._last_audio_delta_time = 0.0
+        self._input_audio_committed_total = 0  # diagnostic: audio buffer commits observed
+        self._last_input_audio_committed_time = 0.0
+        self._response_created_total = 0  # diagnostic: response.created events observed
+        self._last_response_created_time = 0.0
+        self._response_done_total = 0  # diagnostic: response.done events observed
+        self._last_response_done_time = 0.0
+        self._last_response_transcript = ""
+        self._speech_started_total = 0  # diagnostic: server VAD start events observed
+        self._speech_stopped_total = 0  # diagnostic: server VAD stop events observed
+        # Track image recognition per turn
+        self._image_recognized_this_turn = False
+        self._image_sent_this_turn = False
+        self._image_being_analyzed = False
+        self._image_description = "[实时屏幕截图或相机画面正在分析中。先不要瞎编内容，可以稍等片刻。在此期间不要用搜索功能应付。等收到画面分析结果后再描述画面。]"
+        self._latest_image_b64 = None  # Cached latest screenshot for proactive injection
+        self._proactive_image_consumed = True  # Whether the cached image has been used by a proactive nudge
+        self._proactive_injecting = False  # True while prompt_ephemeral is injecting audio — suppresses mic input
+
+        # Silence detection for auto-closing inactive sessions
+        # 只在 GLM 和 free API 时启用90秒静默超时，Qwen 和 Step 放行
+        self._last_speech_time = None
+        self._api_type = api_type or ""
+        self._livestream_mode = bool(livestream_mode)
+        # 只在 GLM 和 free 时启用静默超时；livestream 模式（主播长会话）整路跳过
+        self._enable_silence_timeout = (
+            self._api_type.lower() in ['glm', 'free']
+            and not self._livestream_mode
+        )
+        self._silence_timeout_seconds = 90  # 90秒无语音输入则自动关闭
+        self._silence_check_task = None
+        self._silence_timeout_triggered = False
+        
+        # Audio preprocessing with RNNoise for noise reduction
+        # Auto-resets after 2 seconds of no speech to prevent state drift
+        # Input: 48kHz from PC, 16kHz from mobile
+        # Output: 16kHz for API
+        self._audio_processor = AudioProcessor(
+            input_sample_rate=48000,
+            output_sample_rate=16000,
+            noise_reduce_enabled=True,  # RNNoise noise reduction + VAD
+            on_silence_reset=self._on_silence_reset  # 静音重置时发送 input_audio_buffer.clear
+        )
+        
+        # 静音重置事件异步队列（RNNoise 4秒静音回调用）
+        self._silence_reset_pending = False
+        # 按“上次语音时间”做静音清 buffer：无 RNNoise 时也生效，与 RESET_TIMEOUT 一致
+        self._silence_buffer_clear_seconds = 4.0
+        self._last_silence_clear_speech_time = 0.0
+        # 叠加本地音量：必须连续 2 秒本地静音才允许 clear，避免 VAD 延迟导致误清
+        self._local_quiet_seconds = 2.0
+        self._last_local_loud_time = 0.0
+        
+        # 重复度检测
+        self._recent_responses = []  # 存储最近3轮助手回复
+        self._repetition_threshold = 0.8  # 相似度阈值
+        self._max_recent_responses = OMNI_RECENT_RESPONSES_MAX  # 最多存储的回复数
+        self._current_response_transcript = ""  # 当前回复的转录文本
+        
+        # Backpressure control - 防止503过载错误
+        self._send_semaphore = asyncio.Semaphore(25)  # 最多25个并发发送
+        self._is_throttled = False  # 503检测后节流状态
+        self._throttle_until = 0.0  # 节流结束时间戳
+        self._throttle_duration = 2.0  # 节流持续时间（秒）
+        self._server_busy_count: int = 0  # 503 过载计数，第3次起通知前端
+        
+        # Fatal error detection - 检测到致命错误后立即中断
+        self._fatal_error_occurred = False  # 致命错误标志
+
+        # Interruption state - suppress output after user interruption until next response
+        self._interrupted = False  # 打断状态标志，防止重复消息块
+        self._suppressed_delta_logged_resp_id = None  # 限流：每个 response 只记录一次 text.delta 被拦截的日志
+
+        # Native image input rate limiting
+        self._last_native_image_time = 0.0  # 上次原生图片输入时间戳
+
+        # Unified VAD for image throttling (priority: server VAD > RNNoise > RMS)
+        # All native-image paths use _client_vad_active to adjust send rate
+        self._client_vad_active = False  # 语音活动检测（统一标志）
+        self._client_vad_last_speech_time = 0.0  # 上次检测到语音的时间戳
+        # Grace 从 2.0 提到 6.0：覆盖用户说话时的自然停顿（换气/思考），
+        # 避免 prompt_ephemeral 在用户两句话中间的静默缝隙误触发。
+        self._client_vad_grace_period = 6.0  # 语音结束后保持活跃的宽限期（秒）
+        self._client_vad_threshold = 500  # RMS 能量阈值（int16 范围，fallback用）
+        self._speech_detect_start = 0.0  # RNNoise 连续检测到语音的起始时间
+        self._speech_sustain_threshold = 0.5  # 需持续 500ms 才算真正说话（防噪音误触）
+        self._rnnoise_vad_active = False  # RNNoise VAD 是否正在运行（48kHz + denoiser ok）
+        # Fudge 保护专用信号：与 _client_vad_active 解耦，记录"最近任何一帧 RNNoise
+        # 判定为语音（>0.4，无需 sustain 500ms）或 server-VAD speech_started"的时刻。
+        # 解决两个 _client_vad_active 覆盖不到的窗口：
+        #   1. 用户说话首 500ms 还未达 sustain 阈值时
+        #   2. 句子间停顿 >grace_period 时 _client_vad_active flip False 的瞬间
+        # prompt_ephemeral 在此窗口内直接放弃注入。
+        self._user_recent_activity_time = 0.0
+        self._user_recent_activity_window = 8.0
+        # 对称于 _user_recent_activity_time 的 AI 侧信号。任何一帧 AI 内容下发都打点。
+        # 与 _is_responding 正交 —— _is_responding 是 response 生命周期（server 侧
+        # response.created/done / Gemini turn_complete 驱动），但下列场景下 content
+        # 流与之不同步：
+        #   1. OpenAI response.created 到首 content chunk 之间的几百毫秒空窗
+        #   2. Gemini turn_complete 早于最后几帧音频送达 → late audio
+        #   3. Gemini 长回复被拆多 sub-turn，两个 sub-turn 之间 False 的瞬间
+        # prompt_ephemeral 和 Gemini turn 分配分别用此信号兜底 "fudge 打断 AI 自己"
+        # 和 "late audio 被当新 turn" 两个 race。不改 _is_responding 语义（它还有
+        # 8 个消费者：handle_interruption / QQ 插件 / system_router 409 等），只做正交增量。
+        self._ai_recent_activity_time = 0.0
+        self._ai_recent_activity_window = 3.0
+
+        # 防止log刷屏机制（当websocket关闭后）
+        self._last_ws_none_warning_time = 0.0  # 上次websocket为None警告的时间戳
+        self._ws_none_warning_interval = 5.0  # websocket为None警告的最小间隔（秒）
+
+        # Image processing lock
+        self._image_lock = asyncio.Lock()
+
+        # Audio processing lock to ensure sequential processing in thread pool
+        self._audio_processing_lock = asyncio.Lock()
+
+        # Gemini Live API specific attributes
+        self._is_gemini = self._api_type.lower() == 'gemini'
+
+        # Whether this API returns server-side VAD events (speech_started/speech_stopped)
+        # Gemini (direct) and lanlan.app+free (Gemini proxy) do NOT have server VAD
+        self._has_server_vad = not self._is_gemini and not (
+            'lanlan.app' in (base_url or '') and 'free' in self._model_lower
+        )
+
+        # Whether this client supports native image input
+        # qwen/glm/gpt/gemini have native vision; lanlan.app replacement server (free, non-mainland) also does
+        self._supports_native_image = (
+            any(m in self._model_lower for m in ['qwen', 'glm', 'gpt'])
+            or self._is_gemini
+            or ('lanlan.app' in (base_url or '') and 'free' in self._model_lower)
+        )
+        self._gemini_client = None  # genai.Client instance
+        self._gemini_session = None  # Live session from SDK
+        self._gemini_context_manager = None  # For proper cleanup
+        self._gemini_current_transcript = ""  # Current response transcript for Gemini
+        self._gemini_user_transcript = ""  # Accumulated user input transcript
+
+        # ── Tool calling state ────────────────────────────────────────
+        # ``_tool_definitions`` is the canonical list (ToolDefinition);
+        # the wire-format snapshots are rebuilt from it on each connect/
+        # update_session so callers can mutate the list at any time.
+        self.on_tool_call: Optional[OnToolCallCallback] = on_tool_call
+        self._tool_definitions: List[ToolDefinition] = list(tool_definitions or [])
+        # Provider behaviour matrix:
+        #   gpt   → flat schema, response.done has output[].type=function_call
+        #   glm   → flat schema, response.function_call_arguments.done event
+        #           (no call_id — synthesize from response_id+output_index)
+        #   step  → nested schema, response.function_call_arguments.done event
+        #   free  (lanlan.tech proxies StepFun) → same as step. lanlan.app
+        #          proxies Vertex Live and is NOT plumbed yet (server side
+        #          strips tools); see TODO in core.py.
+        #   qwen  → no custom tool calling per Aliyun docs (only enable_search)
+        #   gemini → genai SDK config.tools, response.tool_call.function_calls
+        # The provider-side flags below let event handlers cheaply route.
+        self._supports_tools_wire = self._api_type.lower() in ('gpt', 'glm', 'qwen', 'step', 'free', 'gemini')
+        # Per-call accumulator for OpenAI-Realtime / StepFun delta arguments
+        # keyed by call_id. cleared on response.done.
+        self._inflight_tool_args: Dict[str, Dict[str, Any]] = {}
+        # GLM: track response_id+output_index → synthesized call_id since
+        # GLM's function_call_arguments.done lacks an explicit call_id field.
+        self._glm_tool_index_to_id: Dict[str, str] = {}
+
+    def _fire_task(self, coro):
+        """Create a background task with GC protection."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    # ------------------------------------------------------------------
+    # Tool calling configuration
+    # ------------------------------------------------------------------
+
+    def set_tools(self, tool_definitions: Optional[List[ToolDefinition]]) -> None:
+        """Replace the active tool list. Takes effect the next time the
+        client builds its session config (next ``connect`` call). For an
+        already-connected session, callers can also call
+        ``apply_tools_to_session`` to push the new list mid-conversation
+        (only providers whose protocol allows mid-session tool updates
+        will honour it; OpenAI Realtime and Step accept ``session.update``
+        with new ``tools``)."""
+        self._tool_definitions = list(tool_definitions or [])
+
+    def set_tool_call_handler(self, handler: Optional[OnToolCallCallback]) -> None:
+        self.on_tool_call = handler
+
+    def has_tools(self) -> bool:
+        return bool(self._tool_definitions) and self.on_tool_call is not None
+
+    def _tools_for_openai_realtime(self) -> List[Dict[str, Any]]:
+        """OpenAI Realtime / GLM Realtime schema — flat (type/name/
+        description/parameters at the same level)."""
+        return [t.to_openai_realtime() for t in self._tool_definitions] if self.has_tools() else []
+
+    def _tools_for_step(self) -> List[Dict[str, Any]]:
+        """StepFun Realtime schema — nested under ``function``."""
+        return [t.to_openai_chat() for t in self._tool_definitions] if self.has_tools() else []
+
+    def _tools_for_qwen(self) -> List[Dict[str, Any]]:
+        """Qwen-Omni-Realtime schema — nested under ``function``，与
+        StepFun 同形（参考 Aliyun client-events 文档示例）。"""
+        return [t.to_openai_chat() for t in self._tool_definitions] if self.has_tools() else []
+
+    def _tools_for_gemini_live(self) -> List[Any]:
+        """Gemini Live SDK ``tools`` config — list of ``types.Tool``.
+        Returns ``[]`` if no tools so caller can decide to keep the
+        existing google_search Tool intact."""
+        if not self.has_tools() or types is None:
+            return []
+        decls = [t.to_gemini_function_declaration() for t in self._tool_definitions]
+        return [types.Tool(function_declarations=decls)]
+
+    async def apply_tools_to_session(self) -> None:
+        """Push the current tools list to the connected session
+        mid-conversation. Caller is responsible for calling this only
+        after the session is connected."""
+        if not self.ws and not self._gemini_session:
+            return
+        if self._is_gemini:
+            # Gemini Live API does not support session.update mid-session;
+            # tool list is fixed at connect time. Log + ignore.
+            logger.info("apply_tools_to_session: Gemini Live does not support mid-session tools update — ignoring")
+            return
+        api = self._api_type.lower()
+        if api == 'step' or api == 'free':
+            # StepFun / 自由路 keep the built-in web_search tool alongside
+            # any custom tools — server expects the full list each update.
+            tools_payload: List[Dict[str, Any]] = [
+                {"type": "web_search",
+                 "function": {"description": "这个web_search用来搜索互联网的信息"}}
+            ]
+            tools_payload.extend(self._tools_for_step())
+            await self.update_session({"tools": tools_payload})
+        elif api == 'gpt':
+            payload: Dict[str, Any] = {"tools": self._tools_for_openai_realtime()}
+            if self.has_tools():
+                payload["tool_choice"] = "auto"
+            await self.update_session(payload)
+        elif api == 'glm':
+            # GLM 文档要求："ServerVAD 时更新 tools 需同时传入 turn_detection"。
+            # 此方法的调用前提是已 connect()，连接时已把 turn_detection 设成
+            # server_vad —— 这里复发同样的值即可，免得服务端 reset 成默认。
+            await self.update_session({
+                "tools": self._tools_for_openai_realtime(),
+                "turn_detection": {"type": "server_vad"},
+            })
+        elif api == 'qwen':
+            # Qwen-Omni-Realtime: tools 与 enable_search 互斥；当我们
+            # 注册了自定义工具，强制关掉 enable_search 防止 server 拒绝。
+            qwen_payload: Dict[str, Any] = {"tools": self._tools_for_qwen()}
+            if self.has_tools():
+                qwen_payload["enable_search"] = False
+            await self.update_session(qwen_payload)
+        else:
+            logger.info("apply_tools_to_session: api_type=%s does not support custom tools — ignoring", api)
+
+    async def process_audio_chunk_async(self, audio_chunk: bytes) -> bytes:
+        """
+        Asynchronously process audio chunk using RNNoise in a separate thread.
+        This prevents blocking the main event loop during heavy calculation.
+        """
+        if self._audio_processor is None:
+            return audio_chunk
+
+        async with self._audio_processing_lock:
+            # Use run_in_executor to offload heavy processing
+            # None = use default ThreadPoolExecutor
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, 
+                self._audio_processor.process_chunk, 
+                audio_chunk
+            )
+
+    async def _check_silence_timeout(self):
+        """定期检查是否超过静默超时时间，如果是则触发超时回调"""
+        # 如果未启用静默超时（Qwen 或 Step），直接返回
+        if not self._enable_silence_timeout:
+            logger.debug(f"静默超时检测已禁用（API类型: {self._api_type}）")
+            return
+        
+        try:
+            while self.ws:
+                # 检查websocket是否还有效（直接访问并捕获异常）
+                try:
+                    if not self.ws:
+                        break
+                except Exception:
+                    break
+                    
+                await asyncio.sleep(10)  # 每10秒检查一次
+                
+                if self._silence_timeout_triggered:
+                    continue
+                
+                # 选择语音活动时间源：有 server VAD 用 _last_speech_time，否则用客户端 VAD
+                if self._has_server_vad:
+                    speech_time = self._last_speech_time
+                else:
+                    # 无 server VAD 时（free/gemini），用客户端能量/RNNoise 检测的时间戳
+                    speech_time = self._client_vad_last_speech_time if self._client_vad_last_speech_time > 0 else None
+                
+                if speech_time is None:
+                    # 还没有检测到任何语音，从现在开始计时
+                    self._last_speech_time = time.time()
+                    self._client_vad_last_speech_time = self._last_speech_time
+                    continue
+                
+                elapsed = time.time() - speech_time
+                if elapsed >= self._silence_timeout_seconds:
+                    logger.warning(f"⏰ 检测到{self._silence_timeout_seconds}秒无语音输入，触发自动关闭")
+                    self._silence_timeout_triggered = True
+                    if self.on_silence_timeout:
+                        await self.on_silence_timeout()
+                    break
+        except asyncio.CancelledError:
+            logger.info("静默检测任务被取消")
+        except Exception as e:
+            logger.error(f"静默检测任务出错: {e}")
+    
+    def _on_silence_reset(self):
+        """当音频处理器检测到4秒静音并重置缓存时调用。标记待发送clear事件。"""
+        self._silence_reset_pending = True
+    
+    def _should_clear_audio_buffer_on_silence(
+        self, current_time: float, use_rnnoise_path: bool
+    ) -> bool:
+        """是否应在静音时清空 input_audio_buffer。
+        
+        有 RNNoise 且当前走 RNNoise 路径：以 RNNoise 为准（内部 4 秒静音回调置 _silence_reset_pending）。
+        无 RNNoise（或未走 RNNoise 路径）：以 VAD + 连续本地静音为准。
+        
+        连续静音判定标准：
+        - 时长：最近 _local_quiet_seconds 秒（默认 2 秒）内无“大音量”；
+        - 大音量：原始 PCM 的 RMS > _client_vad_threshold（默认 500，int16 范围）。
+        即：每帧用原始输入算 RMS，超过阈值则更新 _last_local_loud_time；只有
+        (current_time - _last_local_loud_time) >= _local_quiet_seconds 才认为连续静音。
+        
+        返回 True 时，调用方统一置 _silence_reset_pending=False。
+        """
+        if use_rnnoise_path:
+            return self._silence_reset_pending
+        # core.py 预处理路径：RNNoise 在 process_audio_chunk_async 中运行，
+        # 16kHz 结果送入 stream_audio → use_rnnoise_path=False，
+        # 但 _silence_reset_pending 仍可能已被 AudioProcessor 回调置位。
+        if self._silence_reset_pending:
+            return True
+        # 纯非 RNNoise 路径：VAD 静音 ≥ _silence_buffer_clear_seconds 且 连续本地静音 ≥ _local_quiet_seconds
+        if self._has_server_vad:
+            last_speech = self._last_speech_time
+        else:
+            last_speech = self._client_vad_last_speech_time if self._client_vad_last_speech_time > 0 else None
+        if last_speech is None:
+            return False
+        local_quiet_elapsed = current_time - self._last_local_loud_time
+        if local_quiet_elapsed < self._local_quiet_seconds:
+            return False
+        silence_elapsed = current_time - last_speech
+        if silence_elapsed < self._silence_buffer_clear_seconds:
+            return False
+        if last_speech <= self._last_silence_clear_speech_time:
+            return False
+        self._last_silence_clear_speech_time = last_speech
+        return True
+    
+    async def clear_audio_buffer(self):
+        """发送 input_audio_buffer.clear 事件清空服务端缓存。"""
+        clear_event = {
+            "type": "input_audio_buffer.clear"
+        }
+        await self.send_event(clear_event)
+        logger.debug("📤 已发送 input_audio_buffer.clear 事件")
+
+    async def connect(self, instructions: str, native_audio=True) -> None:
+        """Establish WebSocket connection with the Realtime API."""
+        # Validate turn_detection_mode BEFORE any side effect (websockets.connect,
+        # silence-check task, or Gemini SDK init). Applies uniformly to all providers.
+        if self.turn_detection_mode not in (TurnDetectionMode.MANUAL, TurnDetectionMode.SERVER_VAD):
+            raise ValueError(f"Invalid turn detection mode: {self.turn_detection_mode}")
+
+        # Gemini uses google-genai SDK, not raw WebSocket
+        if self._is_gemini:
+            await self._connect_gemini(instructions, native_audio)
+            return
+
+        # 确保开始新连接时状态完全重置
+        self._silence_reset_pending = False
+        self._last_silence_clear_speech_time = 0.0
+        self._last_local_loud_time = 0.0
+        self._client_vad_active = False
+        self._client_vad_last_speech_time = 0.0
+        self._speech_detect_start = 0.0
+        self._rnnoise_vad_active = False
+        self._user_recent_activity_time = 0.0
+        self._ai_recent_activity_time = 0.0
+        if self._audio_processor is not None:
+            self._audio_processor.reset()
+
+        # WebSocket-based APIs (GLM, Qwen, GPT, Step, Free)
+        url = f"{self.base_url}?model={self.model}" if self._model_lower != "free-model" else self.base_url
+        headers = {
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        # close_timeout=0.5 缩短 close handshake 的等待上限：默认 10s 会把
+        # end_session 协程挂住数百毫秒~数秒（Qwen 回 CLOSE 帧偶尔很慢），
+        # 超时后 websockets 内部会 transport.abort() 强制关闭。
+        self.ws = await websockets.connect(url, additional_headers=headers, close_timeout=0.5)
+        # Clear fatal flag so send_event/update_session work on this new
+        # connection (flag may be leftover from a previous failed session
+        # when the same OmniRealtimeClient instance is reused).
+        self._fatal_error_occurred = False
+
+        # 启动静默检测任务（只在启用时）
+        self._last_speech_time = time.time()
+        self._silence_timeout_triggered = False
+        if self._silence_check_task:
+            self._silence_check_task.cancel()
+        # 只在启用静默超时时启动检测任务
+        if self._enable_silence_timeout:
+            self._silence_check_task = asyncio.create_task(self._check_silence_timeout())
+        else:
+            reason = "livestream模式" if self._livestream_mode else f"API类型: {self._api_type}"
+            logger.info(f"静默超时检测已禁用（{reason}），不会自动关闭会话")
+
+        # Set up default session configuration
+        is_manual = self.turn_detection_mode == TurnDetectionMode.MANUAL
+        # MANUAL mode: every per-provider session.update below sends
+        # ``turn_detection: null``, so the provider will NOT emit
+        # speech_started / speech_stopped events. _has_server_vad was
+        # initialised in __init__ from provider/model heuristics
+        # (defaults to True for Qwen/GLM/GPT/Step/lanlan.tech-free), but
+        # those events won't arrive in MANUAL — so downstream branches in
+        # stream_audio() and _check_silence_timeout() must take the
+        # client-VAD path, same as Gemini / lanlan.app-free. Override the
+        # flag here uniformly across all providers; the Gemini connect
+        # path is unaffected because __init__ already set this to False
+        # for ``_is_gemini`` clients.
+        if is_manual:
+            self._has_server_vad = False
+        self._modalities = ["text", "audio"] if native_audio else ["text"]
+
+        if 'glm' in self._model_lower:
+            # GLM: server_vad payload in SERVER_VAD; turn_detection=null in MANUAL.
+            # Best-effort — provider may reject; if so we degrade to local-suppression-only.
+            glm_session = {
+                "instructions": instructions,
+                "modalities": self._modalities ,
+                "voice": self.voice if self.voice else "tongtong",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm",
+                "turn_detection": None if is_manual else {
+                    "type": "server_vad",
+                },
+                "input_audio_noise_reduction": {
+                    "type": "far_field",
+                },
+                "beta_fields":{
+                    "chat_mode": "video_passive",
+                    "auto_search": True,
+                },
+                "temperature": 1.0
+            }
+            # GLM Realtime: tools only honoured in audio mode per docs.
+            # Use the flat (OpenAI-Realtime-style) schema GLM expects.
+            if self.has_tools() and 'audio' in self._modalities:
+                glm_session["tools"] = self._tools_for_openai_realtime()
+            await self.update_session(glm_session)
+        elif "qwen" in self._model_lower:
+            qwen_session: Dict[str, Any] = {
+                "instructions": instructions,
+                "modalities": self._modalities ,
+                "voice": self.voice if self.voice else "Momo",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "input_audio_transcription": {
+                    "model": "gummy-realtime-v1"
+                },
+                "turn_detection": None if is_manual else {
+                    # TODO: 未来需要cover更多型号
+                    "type": "semantic_vad" if "3.5" in self._model_lower else "server_vad",
+                    "threshold": 0.55,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 600
+                },
+                "repetition_penalty": 1.2,
+                "temperature": 0.7,
+                # "enable_search": True,
+                # "search_options": {'enable_source': True}
+            }
+            # Qwen-Omni-Realtime 自 2026 起支持 tools（嵌套 function 形，
+            # 同 StepFun）。重要约束：tools 与 enable_search 互斥——
+            # 我们注册了自定义工具时强制 enable_search=False，避免
+            # session.update 被服务端拒绝。文档参见 Aliyun client-events
+            # 章节 "工具调用（tools）和联网搜索（enable_search）不兼容"。
+            if self.has_tools():
+                qwen_session["tools"] = self._tools_for_qwen()
+                qwen_session["enable_search"] = False
+            await self.update_session(qwen_session)
+        elif "gpt" in self._model_lower:
+            gpt_session = {
+                "type": "realtime",
+                "model": self.model,
+                "instructions": instructions,
+                "output_modalities": ['audio'] if 'audio' in self._modalities else ['text'],
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-4o-mini-transcribe"},
+                        "turn_detection": None if is_manual else {
+                            "type": "semantic_vad",
+                            "eagerness": "auto",
+                            "create_response": True,
+                            "interrupt_response": True
+                        },
+                    },
+                    "output": {
+                        "voice": self.voice if self.voice else "marin",
+                        "speed": 1.0
+                    }
+                }
+            }
+            if self.has_tools():
+                gpt_session["tools"] = self._tools_for_openai_realtime()
+                gpt_session["tool_choice"] = "auto"
+            await self.update_session(gpt_session)
+        elif "step" in self._model_lower:
+            step_session = {
+                "instructions": instructions,
+                "modalities": ['text', 'audio'], # Step API只支持这一个模式
+                "voice": self.voice if self.voice else "qingchunshaonv",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": None if is_manual else {
+                    "type": "server_vad"
+                },
+            }
+            # Always keep the built-in web_search; append custom tools
+            # (StepFun supports both type:"web_search" and type:"function"
+            # in the same array — see official docs).
+            step_tools: List[Dict[str, Any]] = [
+                {
+                    "type": "web_search",
+                    "function": {
+                        "description": "这个web_search用来搜索互联网的信息"
+                    }
+                }
+            ]
+            if self.has_tools():
+                step_tools.extend(self._tools_for_step())
+            step_session["tools"] = step_tools
+            await self.update_session(step_session)
+        elif "free" in self._model_lower:
+            # NOTE: lanlan.tech (China free) backs onto StepFun and
+            # supports the StepFun custom-function protocol — the
+            # server-side tool stripping the user mentioned will be
+            # lifted, after which our tools propagate naturally.
+            # lanlan.app (international free) backs onto Vertex AI
+            # Live; that path is currently TODO (no client→server
+            # tools propagation confirmed). Tools below match the
+            # StepFun shape and become a no-op on lanlan.app until
+            # the proxy supports them.
+            #
+            # MANUAL mode: both proxies receive ``turn_detection: null``
+            # via the StepFun-shape websocket session config. lanlan.tech
+            # (StepFun proxy) honours it natively; lanlan.app (Vertex
+            # Gemini proxy) translates the disabled-VAD intent on the
+            # server side, since the proxy already maps StepFun-shape
+            # client events to Vertex Live (see _has_server_vad gate
+            # at __init__ — lanlan.app+free is already treated as
+            # client-side VAD only).
+            free_session = {
+                "instructions": instructions,
+                "modalities": ['text', 'audio'],
+                "voice": self.voice if self.voice else "qingchunshaonv",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "turn_detection": None if is_manual else {
+                    "type": "server_vad"
+                },
+            }
+            free_tools: List[Dict[str, Any]] = [
+                {
+                    "type": "web_search",
+                    "function": {
+                        "description": "这个web_search用来搜索互联网的信息"
+                    }
+                }
+            ]
+            if self.has_tools():
+                free_tools.extend(self._tools_for_step())
+            free_session["tools"] = free_tools
+            await self.update_session(free_session)
+        else:
+            raise ValueError(f"Invalid model: {self.model}")
+        self.instructions = instructions
+    
+    async def _connect_gemini(self, instructions: str, native_audio: bool = True) -> None:
+        """Establish connection with Gemini Live API using google-genai SDK."""
+        if not GEMINI_AVAILABLE or genai is None or types is None:
+            detail = f": {_GEMINI_IMPORT_ERROR}" if _GEMINI_IMPORT_ERROR else ""
+            raise RuntimeError(
+                "google-genai SDK unavailable. "
+                "If this is an SSL/证书问题, repair your system certificate chain or switch to non-Gemini API"
+                f"{detail}"
+            )
+        
+        try:
+            # 创建 Gemini 客户端
+            self._gemini_client = genai.Client(api_key=self.api_key, http_options={"api_version": "v1alpha"})
+            
+            # 配置会话。Gemini Live 接受多个 Tool 实例同时存在，
+            # 一个负责 google_search、一个负责自定义 function_declarations。
+            gemini_tools: List[Any] = [types.Tool(google_search=types.GoogleSearch())]
+            if self.has_tools():
+                gemini_tools.extend(self._tools_for_gemini_live())
+
+            config = {
+                "response_modalities": ["AUDIO"],
+                "system_instruction": instructions,
+                "media_resolution": types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                "tools": gemini_tools,
+                "generation_config": {"temperature": 1.1},
+                "input_audio_transcription": {},
+                "output_audio_transcription": {},
+                "speech_config": types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Leda")
+                    )
+                ),
+            }
+
+            # MANUAL turn detection: disable Gemini's automatic activity
+            # detection so end-of-turn is signalled explicitly by the
+            # client (audio_stream_end / activity_end). SERVER_VAD path
+            # leaves automatic_activity_detection at SDK default (enabled).
+            if self.turn_detection_mode == TurnDetectionMode.MANUAL:
+                config["realtime_input_config"] = types.RealtimeInputConfig(
+                    automatic_activity_detection=types.AutomaticActivityDetection(
+                        disabled=True
+                    )
+                )
+            
+            # 建立 Live 连接 - connect() 返回 async context manager
+            logger.info(f"Connecting to Gemini Live API with model: {self.model}")
+            self._gemini_context_manager = self._gemini_client.aio.live.connect(
+                model=self.model,
+                config=config,
+            )
+            # 手动进入 async context manager
+            self._gemini_session = await self._gemini_context_manager.__aenter__()
+            
+            # 设置 ws 为 session，用于兼容性检查
+            self.ws = self._gemini_session
+            self._fatal_error_occurred = False
+
+            self._last_speech_time = time.time()
+            self.instructions = instructions
+            logger.info("✅ Gemini Live API connected successfully")
+            
+        except Exception as e:
+            error_msg = f"Failed to connect to Gemini Live API: {e}"
+            logger.error(error_msg)
+            self._fatal_error_occurred = True
+            if self.on_connection_error:
+                await self.on_connection_error(error_msg)
+            raise
+
+    # ── Frame-size helpers ──────────────────────────────────────────
+    _WS_FRAME_LIMIT = OMNI_WS_FRAME_LIMIT_BYTES  # safe threshold below 256KB server cap
+
+    @staticmethod
+    def _try_shrink_image_payload(event: dict, payload: str) -> Optional[str]:
+        """Re-compress an oversized image payload at lower JPEG quality.
+
+        Looks for a base64 image blob in the event (``image``,
+        ``video_frame``, or ``image_url`` fields), decodes it, re-encodes
+        at progressively lower quality, and returns a new JSON payload that
+        fits under ``_WS_FRAME_LIMIT``.  Returns *None* if the frame
+        cannot be shrunk (non-image event, or still too big at minimum
+        quality).
+        """
+        from io import BytesIO
+        from PIL import Image as PILImage
+
+        limit = OmniRealtimeClient._WS_FRAME_LIMIT
+
+        # Locate the base64 blob and a setter to write it back
+        b64_data: Optional[str] = None
+        prefix = ""
+
+        etype = event.get("type", "")
+        if "image" in etype and "image" in event:
+            # input_image_buffer.append  →  event["image"]
+            b64_data = event.get("image")
+        elif "video_frame" in etype and "video_frame" in event:
+            # input_audio_buffer.append_video_frame  →  event["video_frame"]
+            b64_data = event.get("video_frame")
+        elif etype == "conversation.item.create":
+            # GPT path: content[0].image_url = "data:image/jpeg;base64,<b64>"
+            try:
+                url = event["item"]["content"][0]["image_url"]
+                if isinstance(url, str) and url.startswith("data:image/"):
+                    prefix, b64_data = url.split(",", 1)
+                    prefix += ","
+            except (KeyError, IndexError, TypeError, ValueError):
+                pass
+
+        if not b64_data:
+            logger.warning(
+                "⚠️ 丢弃超大帧 type=%s size=%d bytes (非图片，无法压缩)",
+                etype, len(payload),
+            )
+            return None
+
+        try:
+            raw = base64.b64decode(b64_data)
+            img = PILImage.open(BytesIO(raw))
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+
+            for quality in (50, 35, 20):
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                new_b64 = base64.b64encode(buf.getvalue()).decode()
+
+                # Write back into the event dict (mutates in place)
+                if "image" in etype and "image" in event:
+                    event["image"] = new_b64
+                elif "video_frame" in etype and "video_frame" in event:
+                    event["video_frame"] = new_b64
+                elif prefix:
+                    event["item"]["content"][0]["image_url"] = prefix + new_b64
+
+                new_payload = json.dumps(event)
+                if len(new_payload) <= limit:
+                    logger.info(
+                        "🗜️ 图片帧重压缩成功 q=%d: %d → %d bytes",
+                        quality, len(payload), len(new_payload),
+                    )
+                    return new_payload
+
+            logger.warning(
+                "⚠️ 丢弃超大图片帧 type=%s (q=20 仍 %d bytes > %d 上限)",
+                etype, len(new_payload), limit,
+            )
+            return None
+        except Exception as e:
+            logger.warning("⚠️ 图片重压缩失败 type=%s: %s — 丢弃帧", etype, e)
+            return None
+
+    async def send_event(self, event) -> None:
+        # 检查是否已发生致命错误，直接跳过发送
+        if self._fatal_error_occurred:
+            return
+        
+        # Gemini 不使用 WebSocket 风格的事件发送
+        # 而是使用 session.send_client_content() 或 session.send_realtime_input()
+        if self._is_gemini:
+            # Gemini 的事件通过专用方法处理，这里直接返回
+            # 对于 session.update / conversation.item.create 等事件，Gemini 不支持
+            logger.debug(f"Gemini mode: skipping WebSocket event {event.get('type', 'unknown')}")
+            return
+        
+        # Backpressure: 检查是否处于节流状态
+        if self._is_throttled:
+            if time.time() < self._throttle_until:
+                # 仍在节流期，丢弃音频帧以减轻服务器压力
+                if event.get("type") == "input_audio_buffer.append":
+                    return  # 丢弃音频帧
+            else:
+                # 节流期结束，恢复正常发送
+                self._is_throttled = False
+                logger.info("🔄 Backpressure throttle ended, resuming sends")
+        
+        # 检查websocket是否有效
+        if not self.ws:
+            return
+        
+        event['event_id'] = "event_" + str(int(time.time() * 1000))
+        async with self._send_semaphore:  # 限制并发发送数量
+            try:
+                if not self.ws:
+                    return
+                payload = json.dumps(event)
+                # Guard: Qwen/GLM/Step servers enforce 256KB max frame; for
+                # oversized image payloads, try to re-compress the JPEG at
+                # lower quality before dropping. PIL decode + JPEG re-encode
+                # is CPU-heavy (50-150ms on a 4K screenshot), so off-load to
+                # a thread to keep the event loop responsive.
+                if len(payload) > OMNI_WS_FRAME_LIMIT_BYTES:
+                    payload = await asyncio.to_thread(
+                        self._try_shrink_image_payload, event, payload
+                    )
+                    if payload is None:
+                        return
+                await self.ws.send(payload)
+            except Exception as e:
+                error_msg = str(e)
+                # ── Fatal WebSocket errors ────────────────────────────
+                # 1009 (message too big) / 1006 (abnormal close) /
+                # 1011 (internal error) / Response timeout
+                # → mark fatal, fire error callback, schedule close,
+                #   and *re-raise* so callers (connect, update_session)
+                #   see the failure instead of assuming success.
+                is_frame_error = '1009' in error_msg or '1006' in error_msg
+                is_server_error = 'Response timeout' in error_msg or '1011' in error_msg
+                if is_frame_error or is_server_error:
+                    if not self._fatal_error_occurred:
+                        self._fatal_error_occurred = True
+                        self.ws = None
+                        code = "WS_FRAME_ERROR" if is_frame_error else "RESPONSE_TIMEOUT"
+                        logger.error("💥 WebSocket 致命错误 (%s)，停止发送: %s", code, error_msg)
+                        if self.on_connection_error:
+                            self._fire_task(self.on_connection_error(json.dumps({"code": code})))
+                        self._fire_task(self.close())
+                    raise
+                if '1000' not in error_msg:
+                    logger.warning(f"⚠️ 发送 {event.get('type', '未知')} 事件失败: {error_msg}")
+
+                raise
+
+    async def update_session(self, config: Dict[str, Any]) -> None:
+        """Update session configuration."""
+        # Mirror the chat-completion chokepoint: catch any unrendered
+        # {placeholder} before the system instruction (nested at provider-
+        # specific paths inside `config`) is shipped over the wire. See
+        # utils/llm_prompt_leak_check.py for rationale.
+        try:
+            from utils import llm_prompt_leak_check
+            llm_prompt_leak_check.check_dict_strings_for_leaks(
+                config, context="OmniRealtimeClient.update_session"
+            )
+        except AssertionError:
+            raise
+        except Exception:
+            pass
+        event = {
+            "type": "session.update",
+            "session": config
+        }
+        await self.send_event(event)
+
+    async def stream_audio(self, audio_chunk: bytes) -> None:
+        """Stream raw audio data to the API.
+
+        Supports two input modes:
+        - 48kHz from PC: Apply RNNoise then downsample to 16kHz
+        - 16kHz from mobile: Pass through directly (no RNNoise)
+        """
+        # 检查是否已发生致命错误，如果是则直接返回
+        if self._fatal_error_occurred:
+            return
+
+        current_time = time.time()
+        # 本地音量判定：用原始输入做 RMS，避免 VAD 延迟时误清 buffer
+        raw_samples = np.frombuffer(audio_chunk, dtype=np.int16)
+        if len(raw_samples) > 0:
+            local_rms = np.sqrt(np.mean(raw_samples.astype(np.float32) ** 2))
+            if local_rms > self._client_vad_threshold:
+                self._last_local_loud_time = current_time
+        
+        # Detect input sample rate based on chunk size
+        # 48kHz: 480 samples (10ms) = 960 bytes
+        # 16kHz: 512 samples (~32ms) = 1024 bytes
+        num_samples = len(audio_chunk) // 2  # 16-bit = 2 bytes per sample
+        is_48khz = (num_samples == 480)  # RNNoise frame size
+        
+        
+        use_rnnoise_path = is_48khz and self._audio_processor is not None
+        # Apply RNNoise noise reduction only for 48kHz input (PC)
+        if use_rnnoise_path:
+            # Use async wrapper to avoid blocking main loop
+            audio_chunk = await self.process_audio_chunk_async(audio_chunk)
+            
+            # Skip if RNNoise is buffering (returns empty)
+            if len(audio_chunk) == 0:
+                return
+        
+        # Unified VAD update (priority: server VAD > RNNoise > RMS)
+        # Grace period check: always runs regardless of VAD source
+        if self._client_vad_active and current_time - self._client_vad_last_speech_time > self._client_vad_grace_period:
+            self._client_vad_active = False
+        
+        # Client-side speech detection (only when no server VAD — server events handle it in handle_messages)
+        # use_rnnoise_path is true only for 48kHz input when AudioProcessor exists;
+        # for 16kHz/mobile input RNNoise doesn't run, so fall back to RMS.
+        _rnnoise_vad_live = use_rnnoise_path and self._audio_processor.noise_reduce_enabled and self._audio_processor._denoiser is not None
+        self._rnnoise_vad_active = _rnnoise_vad_live
+        if not self._has_server_vad:
+            if _rnnoise_vad_live:
+                # Priority 2: RNNoise speech probability with sustained threshold
+                if self._audio_processor.speech_probability > 0.4:
+                    # B: 单帧 RNNoise 判定为语音就立即打点，独立于 sustain。
+                    # _client_vad_active 仍需 500ms sustain，_user_recent_activity
+                    # 只看"最近是否发声"，fudge guard 用它兜住首 500ms 和停顿缝隙。
+                    self._user_recent_activity_time = current_time
+                    if self._speech_detect_start == 0.0:
+                        self._speech_detect_start = current_time
+                    elif current_time - self._speech_detect_start >= self._speech_sustain_threshold:
+                        self._client_vad_last_speech_time = current_time
+                        self._client_vad_active = True
+                else:
+                    self._speech_detect_start = 0.0
+            else:
+                # Priority 3: RMS energy fallback
+                samples = np.frombuffer(audio_chunk, dtype=np.int16)
+                if len(samples) > 0:
+                    rms = np.sqrt(np.mean(samples.astype(np.float32) ** 2))
+                    if rms > self._client_vad_threshold:
+                        self._client_vad_last_speech_time = current_time
+                        self._client_vad_active = True
+                        # RMS 噪音率高，但若 RNNoise 不可用（16kHz/移动端），
+                        # RMS 是唯一信号，也喂给 B 兜底。阈值已经是 500（较高），
+                        # 一般环境噪音达不到。
+                        self._user_recent_activity_time = current_time
+        
+        # Suppress mic → server during proactive nudge injection (VAD above still updates)
+        if self._proactive_injecting:
+            return
+
+        # 静音清 buffer：有 RNNoise 以 RNNoise 为准，否则 VAD + 连续本地静音（见 _should_clear_audio_buffer_on_silence）
+        if self._should_clear_audio_buffer_on_silence(current_time, use_rnnoise_path):
+            self._silence_reset_pending = False
+            await self.clear_audio_buffer()
+
+        # Gemini uses different API
+        if self._is_gemini:
+            await self._stream_audio_gemini(audio_chunk)
+            return
+        
+        audio_b64 = base64.b64encode(audio_chunk).decode()
+
+        append_event = {
+            "type": "input_audio_buffer.append",
+            "audio": audio_b64
+        }
+        await self.send_event(append_event)
+    
+    async def _stream_audio_gemini(self, audio_chunk: bytes) -> None:
+        """Send audio data to Gemini Live API."""
+        if not self._gemini_session:
+            return
+
+        try:
+            # 发送实时音频输入
+            await self._gemini_session.send_realtime_input(
+                audio={"data": audio_chunk, "mime_type": "audio/pcm"}
+            )
+            self._last_speech_time = time.time()
+        except Exception as e:
+            logger.error(f"Error sending audio to Gemini: {e}")
+            if "closed" in str(e).lower():
+                self._fatal_error_occurred = True
+
+    async def signal_user_activity_end(self) -> None:
+        """Explicitly signal end-of-turn in MANUAL VAD mode.
+
+        With ``TurnDetectionMode.MANUAL`` the server-side VAD is
+        disabled, so the client owns turn boundaries and must emit a
+        provider-specific signal when the user stops speaking. Without
+        this, the model will never see a turn boundary and never
+        respond.
+
+        Per provider (MANUAL only — no-op in SERVER_VAD):
+        - Gemini Live: ``send_realtime_input(activity_end=ActivityEnd())``
+          (Google genai SDK ``LiveClientRealtimeInput`` docs:
+          "If automatic voice detection is disabled, the client must
+          send activity signals." ``audio_stream_end`` is NOT applicable
+          here — it's documented as "only when automatic activity
+          detection is enabled".)
+        - OpenAI / Qwen / GLM / Step / Free: ``input_audio_buffer.commit``
+          followed by ``response.create``.
+        """
+        if self.turn_detection_mode != TurnDetectionMode.MANUAL:
+            return
+        if self._fatal_error_occurred:
+            return
+        if self._is_gemini:
+            if not self._gemini_session:
+                return
+            if types is None:
+                logger.error("signal_user_activity_end: genai.types unavailable")
+                return
+            try:
+                await self._gemini_session.send_realtime_input(
+                    activity_end=types.ActivityEnd()
+                )
+            except Exception as e:
+                logger.error(f"Error sending activity_end to Gemini: {e}")
+                if "closed" in str(e).lower():
+                    self._fatal_error_occurred = True
+            return
+        await self.send_event({"type": "input_audio_buffer.commit"})
+        await self.send_event({"type": "response.create"})
+
+    async def _analyze_image_with_vision_model(self, image_b64: str) -> str:
+        """Use VISION_MODEL to analyze image and return description."""
+        try:
+            # 使用统一的视觉分析函数
+            from utils.screenshot_utils import analyze_image_with_vision_model
+            
+            description = await analyze_image_with_vision_model(
+                image_b64=image_b64,
+                max_completion_tokens=VISION_ANALYSIS_MAX_TOKENS
+            )
+            
+            if description:
+                self._image_description = f"[实时屏幕截图或相机画面]: {description}"
+                logger.info("✅ Image analysis complete.")
+                self._image_recognized_this_turn = True
+                return description
+            else:
+                logger.warning("VISION_MODEL not configured or analysis failed")
+                self._image_description = "[实时屏幕截图或相机画面]: 画面分析失败或暂时无法识别。"
+                self._image_recognized_this_turn = True
+                return ""
+            
+        except Exception as e:
+            logger.error(f"Error analyzing image with vision model: {e}")
+            self.image_recognized_this_turn = True
+            self._image_being_analyzed = False
+            self._image_description = f"[实时屏幕截图或相机画面]: 分析出错: {str(e)}"
+            # 检测内容审查错误并发送中文提示到前端（不关闭session）
+            error_str = str(e)
+            if 'censorship' in error_str:
+                if self.on_status_message:
+                    await self.on_status_message(json.dumps({"code": "IMAGE_BLOCKED"}))
+            return "图片识别发生严重错误！"
+    
+    async def stream_image(self, image_b64: str) -> None:
+        """Stream raw image data to the API."""
+        # Cache latest frame for proactive injection
+        self._latest_image_b64 = image_b64
+        self._proactive_image_consumed = False
+
+        try:
+            # Models without native vision (step, free on lanlan.tech) — first frame triggers VISION_MODEL analysis
+            if '实时屏幕截图或相机画面正在分析中' in self._image_description and not self._supports_native_image:
+                await self._analyze_image_with_vision_model(image_b64)
+                return
+            
+            # Rate limiting for native image input (with VAD-based throttling)
+            if self._supports_native_image:
+                current_time = time.time()
+                elapsed = current_time - self._last_native_image_time
+                min_interval = NATIVE_IMAGE_MIN_INTERVAL
+                if not self._client_vad_active:
+                    min_interval *= IMAGE_IDLE_RATE_MULTIPLIER
+                if elapsed < min_interval:
+                    # Skip this image frame due to rate limiting
+                    return
+                self._last_native_image_time = current_time
+
+            # Gemini uses SDK, not WebSocket events (_audio_in_buffer is not set for Gemini)
+            if self._is_gemini:
+                if self._gemini_session:
+                    try:
+                        image_bytes = base64.b64decode(image_b64)
+                        await self._gemini_session.send_realtime_input(
+                            media={"data": image_bytes, "mime_type": "image/jpeg"}
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending image to Gemini: {e}")
+                        if "closed" in str(e).lower():
+                            self._fatal_error_occurred = True
+                return
+
+            if ('lanlan.app' in self.base_url and 'free' in self._model_lower):
+                append_event = {
+                    "type": "input_image_buffer.append" ,
+                    "image": image_b64
+                }
+                await self.send_event(append_event)
+                return
+
+            if self._audio_in_buffer:
+                if "qwen" in self._model_lower:
+                    append_event = {
+                        "type": "input_image_buffer.append" ,
+                        "image": image_b64
+                    }
+                elif "glm" in self._model_lower:
+                    append_event = {
+                        "type": "input_audio_buffer.append_video_frame",
+                        "video_frame": image_b64
+                    }
+                elif "gpt" in self._model_lower:
+                    append_event = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "data:image/jpeg;base64," + image_b64
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    # Model does not support video streaming, use VISION_MODEL to analyze
+                    # Only recognize one image per conversation turn
+                    async with self._image_lock:
+                        if not self._image_recognized_this_turn:
+                            if not self._image_being_analyzed:
+                                self._image_being_analyzed = True
+                                text_event = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "input_text",
+                                                "text": self._image_description
+                                            }
+                                        ]
+                                    }
+                                }
+                                logger.info("Sending image description before recognition.")
+                                await self.send_event(text_event)
+                                await self._analyze_image_with_vision_model(image_b64)
+                        elif not self._image_sent_this_turn:
+                            self._image_sent_this_turn = True
+                            text_event = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "input_text",
+                                                "text": self._image_description
+                                            }
+                                        ]
+                                    }
+                                }
+                            logger.info("Sending image description after recognition.")
+                            await self.send_event(text_event)
+                    return
+                    
+                await self.send_event(append_event)
+        except Exception as e:
+            logger.error(f"Error streaming image: {e}")
+            raise e
+
+    # ------------------------------------------------------------------
+    # LLM message injection channels
+    #
+    # Three distinct channels mirror the OmniOfflineClient interface:
+    #
+    #   prime_context(text, skipped)
+    #       Session-start context priming.  通过 session.update 追加到
+    #       系统指令，不创建用户消息，不触发模型响应。
+    #       与 OmniOfflineClient.prime_context 语义一致。
+    #       Typical caller: core._perform_final_swap_sequence()
+    #
+    #   create_response(text, skipped)
+    #       Mid-conversation persistent message + trigger LLM response.
+    #       会创建 user 角色消息并触发 response.create。
+    #       Behaviour varies by provider:
+    #         OpenAI / GLM / Step → conversation.item.create(role=user) + response.create
+    #         Gemini              → send_client_content(role=user)
+    #
+    #   prompt_ephemeral(instruction, *, language)
+    #       Fire-and-forget audio nudge.  Injects a short WAV clip via
+    #       input_audio_buffer so the model "hears" a conversational
+    #       prompt and responds.  The instruction itself is not persisted.
+    #       Typical callers: core.trigger_voice_proactive_nudge()
+    # ------------------------------------------------------------------
+
+    async def prime_context(self, text: str, skipped: bool = False) -> None:
+        """Inject context during hot-swap.
+
+        行为取决于 skipped 参数和提供商：
+
+        - ``skipped=True`` (或 Qwen)：通过 ``session.update`` 追加到
+          系统指令，不触发模型响应。
+        - ``skipped=False`` (GPT/GLM/Step)：通过 ``create_response``
+          注入一条一次性 user 消息并触发模型响应（用于任务结果主动
+          汇报）。注意：此路径不写入 session instructions，文本是
+          瞬态的，不要改为持久化到 instructions。
+        - Gemini：无论 skipped 值，均通过 ``send_client_content``
+          注入（SDK 限制，无 session.update 机制）。skipped=True 时
+          通过 ``_skip_until_next_response`` 静默丢弃响应。
+
+        Args:
+            text: Context to inject (incremental cache + summary/ready).
+            skipped: If True, only update instructions without triggering
+                     a response. If False, also trigger model response.
+        """
+        if not text or not text.strip():
+            logger.info("prime_context: skipping empty content")
+            return
+
+        if self._is_gemini:
+            # Gemini Live API 没有 session.update 机制，只能通过
+            # send_client_content 注入上下文（会创建 user turn）。
+            # on_response_done 由 _handle_messages_gemini 自然触发。
+            if skipped:
+                self._skip_until_next_response = True
+            await self._create_response_gemini(text)
+            return
+
+        if not skipped and "qwen" not in self._model_lower:
+            # skipped=False：需要模型主动响应（任务结果汇报）
+            # 通过 create_response 注入 user 消息 + 触发响应
+            # Qwen 不支持 conversation.item.create，走下方 update_session
+            await self.create_response(text)
+        else:
+            # skipped=True 或 Qwen：仅追加到 session instructions
+            await self.update_session({"instructions": self.instructions + '\n' + text})
+            logger.info("prime_context: updated session instructions")
+
+    async def create_response(self, instructions: str, skipped: bool = False) -> None:
+        """Inject a persistent user message and trigger an LLM response.
+
+        与 ``prime_context`` (追加到系统指令) 不同，此方法会创建一条
+        user 角色的会话消息并触发模型响应。适用于需要模型立即回复的
+        mid-conversation 场景。
+
+        注意：需要会话中已有 user 消息或所用 API 支持
+        ``conversation.item.create``，否则可能触发 1007 错误。
+
+        Behaviour varies by provider:
+          - **OpenAI / GLM / Step**: ``conversation.item.create(role=user)``
+            + ``response.create``
+          - **Gemini**: ``send_client_content(role=user)``
+
+        See ``prime_context()`` (session-start priming) and
+        ``prompt_ephemeral()`` (fire-and-forget audio nudge) for the other
+        two injection channels.
+        """
+        # Gemini 使用 send_client_content 发送文本内容
+        if self._is_gemini:
+            if not instructions or not instructions.strip():
+                logger.info("Gemini: skipping empty content in create_response")
+                return
+            if skipped:
+                self._skip_until_next_response = True
+            await self._create_response_gemini(instructions)
+            return
+
+        # 跳过空内容的发送，避免触发 API 错误
+        if not instructions or not instructions.strip():
+            logger.info("Skipping empty content in create_response")
+            return
+
+        if skipped:
+            self._skip_until_next_response = True
+
+        # 通过 conversation.item.create 添加用户消息，再触发响应
+        item_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": instructions
+                    }
+                ]
+            }
+        }
+        await self.send_event(item_event)
+
+        logger.info("Creating response with user message")
+        await self.send_event({"type": "response.create"})
+    
+    async def _create_response_gemini(self, instructions: str) -> None:
+        """Send text content to Gemini and trigger response."""
+        if not self._gemini_session:
+            logger.warning("Gemini session not available for create_response")
+            return
+        
+        # 跳过空内容的发送，避免预热时污染 Gemini 对话历史
+        if not instructions or not instructions.strip():
+            logger.info("Gemini: skipping empty content (warmup or empty message)")
+            return
+        
+        try:
+            # Gemini 使用 send_client_content 发送文本
+            from google.genai import types as genai_types
+            
+            content = genai_types.Content(
+                parts=[genai_types.Part(text=instructions)],
+                role="user"
+            )
+            await self._gemini_session.send_client_content(
+                turns=[content],
+                turn_complete=True
+            )
+            logger.info("Gemini: sent client content, waiting for response")
+        except Exception as e:
+            logger.error(f"Error sending client content to Gemini: {e}")
+
+    async def prompt_ephemeral(
+        self,
+        instruction: str = "",
+        *,
+        language: str = "zh",
+    ) -> bool:
+        """Send a fire-and-forget audio nudge to trigger proactive AI speech.
+
+        Injects a short WAV clip via ``input_audio_buffer.append`` so the
+        realtime model "hears" a conversational nudge and responds.  Bypasses
+        ``stream_audio()`` (no RNNoise / AGC) since the audio is clean.
+
+        Unlike ``prime_context`` (session-start system-prompt injection) and
+        ``create_response`` (persistent mid-conversation message), this
+        channel is truly ephemeral — the audio prompt is consumed by the
+        model but never stored in conversation history.
+
+        Chunk pacing mirrors hot-swap flush: 1600 bytes/chunk, 0.025 s sleep,
+        40 chunks/s → 2× real-time delivery.
+
+        Returns True if the audio was fully sent, False if skipped or aborted.
+        """
+        # ── Guard checks ──────────────────────────────────────────────
+        if self._fatal_error_occurred or self.ws is None:
+            return False
+        if self._is_responding:
+            logger.debug("prompt_ephemeral: skipped — already responding")
+            return False
+        _now = time.time()
+        # ── AI-speech guard（对称于 _user_recent_activity_time）─────────
+        # _is_responding 已被 response.done / turn_complete flip False，但 AI 侧
+        # content 流可能还在滴水：
+        #   1. Gemini turn_complete 早于最后几帧音频送达
+        #   2. Gemini 长回复 sub-turn 间的 False 瞬间
+        #   3. response.created 到首 content chunk 的空窗（_is_responding 已 True
+        #      覆盖这一条，但加这层冗余保险无害）
+        # 3s 窗口覆盖上述抢跑 gap，避免 fudge 踩着 AI 尾巴打断自己。
+        if _now - self._ai_recent_activity_time < self._ai_recent_activity_window:
+            logger.debug("prompt_ephemeral: skipped — AI recently active (%.2fs ago)",
+                         _now - self._ai_recent_activity_time)
+            return False
+        # ── User-speech guards ───────────────────────────────────────
+        # B: 先用独立的 _user_recent_activity_time 判定近期是否有语音帧；
+        # 此信号不依赖 sustain，覆盖用户说话首 500ms 与句间停顿缝隙。
+        # 适用所有 VAD 源（RNNoise / server-VAD / RMS），所以不再门控在
+        # _rnnoise_vad_active 下 —— RMS 阈值 500 已较保守，误触可接受，
+        # 相比"fudge 切断用户说话"的体验损失值得。
+        if _now - self._user_recent_activity_time < self._user_recent_activity_window:
+            logger.debug("prompt_ephemeral: skipped — user recently active (%.2fs ago)",
+                         _now - self._user_recent_activity_time)
+            return False
+        # A: 现有 _client_vad_active + grace 检查（sustained VAD 信号兜底）。
+        # Grace 已从 2s 扩到 6s，覆盖自然停顿。
+        # 门控条件：存在可靠 VAD 信号源。
+        #   - server-VAD 后端（Qwen/OpenAI）：server 的 speech_started/stopped 可靠，
+        #     不依赖 RNNoise。特别覆盖 16kHz 移动端长句 >8s 的场景（_user_recent_activity
+        #     在 speech_started 打点后 8s 过期，而用户还在说，需要 _client_vad_active 兜底）。
+        #   - RNNoise 客户端 VAD（48kHz 桌面 + Gemini/lanlan.app+free）
+        # RMS-only 路径（16kHz 无 server-VAD）信号太噪，不信任，依赖 _user_recent_activity。
+        if self._has_server_vad or self._rnnoise_vad_active:
+            if self._client_vad_active:
+                logger.debug("prompt_ephemeral: skipped — user speaking (VAD active)")
+                return False
+            if _now - self._client_vad_last_speech_time < self._client_vad_grace_period:
+                logger.debug("prompt_ephemeral: skipped — VAD grace period")
+                return False
+
+        # ── Choose audio file ─────────────────────────────────────────
+        # Vision context exists if an image was analyzed this turn (via
+        # VISION_MODEL text description OR native image input) or we have
+        # an unconsumed frame from stream_image().
+        has_vision = self._image_recognized_this_turn or (
+            self._latest_image_b64 is not None and not self._proactive_image_consumed
+        )
+        # Only backends with native image support can receive raw screenshots;
+        # step / lanlan.tech+free consume vision context as text only.
+        can_inject_image = has_vision and self._supports_native_image
+
+        # Snapshot the current image so concurrent stream_image() calls don't
+        # cause us to mark a newer frame as consumed.
+        snapshot_image_b64 = self._latest_image_b64 if has_vision else None
+
+        prompt_type = "vision" if has_vision else "general"
+        lang = (language or "zh")[:2]
+        filename = f"prompt_{prompt_type}_{lang}.wav"
+
+        try:
+            pcm_data = _load_proactive_audio(filename)
+        except FileNotFoundError:
+            try:
+                pcm_data = _load_proactive_audio(f"prompt_{prompt_type}_zh.wav")
+            except FileNotFoundError:
+                logger.warning("prompt_ephemeral: no audio file found for %s", filename)
+                return False
+
+        # ── Non-native vision: inject text description before audio ───
+        # step / lanlan.tech+free can't receive raw images; send the
+        # VISION_MODEL text analysis so the model has visual context.
+        if has_vision and not can_inject_image and self._image_recognized_this_turn and self._image_description:
+            await self.send_event({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": self._image_description}],
+                },
+            })
+            logger.info("prompt_ephemeral: injected vision text description for non-native backend")
+
+        # ── Suppress mic input during injection ────────────────────────
+        self._proactive_injecting = True
+
+        # ── Send audio chunks (same pacing as hot-swap flush) ─────────
+        # 320 bytes = 10 ms @16 kHz 16-bit mono, ×5 multiplier → 1600 bytes
+        chunk_size = 320 * 5  # 1600 bytes = 50 ms of audio
+        sleep_interval = 0.025  # 25 ms → 40 chunks/s, 2× real-time
+
+        logger.info(
+            "prompt_ephemeral: injecting %s (%d bytes, %s)",
+            filename, len(pcm_data), "vision" if has_vision else "general",
+        )
+
+        total_chunks = (len(pcm_data) + chunk_size - 1) // chunk_size
+        mid_chunk = total_chunks // 2  # Insert image at the midpoint
+        image_injected = False
+
+        try:
+            _inject_start = time.time()
+            for chunk_idx, i in enumerate(range(0, len(pcm_data), chunk_size)):
+                # Abort conditions:
+                #   - AI started responding (self-interrupt protection)
+                #   - _client_vad_active sustained-speech fired (RNNoise only)
+                #   - B: any VAD source detected a new speech frame SINCE injection started
+                #     —— 注入过程中用户突然开口也能丢弃残余 chunk，不至于把用户
+                #     语音与 fudge 音频混在一起喂给模型
+                if self._is_responding or (self._rnnoise_vad_active and self._client_vad_active):
+                    logger.info("prompt_ephemeral: aborted — user spoke or response started")
+                    await self.clear_audio_buffer()
+                    return False
+                if self._user_recent_activity_time > _inject_start:
+                    logger.info("prompt_ephemeral: aborted — user started speaking during injection")
+                    await self.clear_audio_buffer()
+                    return False
+                # Gemini 首 content chunk 到达前 _is_responding 仍是 False（上面那条
+                # 拦不住），但 _ai_recent_activity_time 会在首 chunk 抵达瞬间更新到
+                # > _inject_start，此时 abort 避免和刚起的 AI 响应抢麦。
+                if self._ai_recent_activity_time > _inject_start:
+                    logger.info("prompt_ephemeral: aborted — AI started responding during injection")
+                    await self.clear_audio_buffer()
+                    return False
+
+                chunk = pcm_data[i : i + chunk_size]
+                if self._is_gemini:
+                    if self._gemini_session:
+                        await self._gemini_session.send_realtime_input(
+                            audio={"data": chunk, "mime_type": "audio/pcm"}
+                        )
+                else:
+                    audio_b64 = base64.b64encode(chunk).decode()
+                    await self.send_event({
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_b64,
+                    })
+
+                # Inject cached screenshot at midpoint (only for native-image backends)
+                if can_inject_image and not image_injected and chunk_idx >= mid_chunk and snapshot_image_b64:
+                    if self._is_gemini:
+                        if self._gemini_session:
+                            image_bytes = base64.b64decode(snapshot_image_b64)
+                            await self._gemini_session.send_realtime_input(
+                                media={"data": image_bytes, "mime_type": "image/jpeg"}
+                            )
+                    elif "gpt" in self._model_lower:
+                        await self.send_event({
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_image",
+                                    "image_url": "data:image/jpeg;base64," + snapshot_image_b64,
+                                }],
+                            },
+                        })
+                    elif "qwen" in self._model_lower or ("lanlan.app" in self.base_url and "free" in self._model_lower):
+                        await self.send_event({
+                            "type": "input_image_buffer.append",
+                            "image": snapshot_image_b64,
+                        })
+                    elif "glm" in self._model_lower:
+                        await self.send_event({
+                            "type": "input_audio_buffer.append_video_frame",
+                            "video_frame": snapshot_image_b64,
+                        })
+                    image_injected = True
+                    logger.info("prompt_ephemeral: injected screenshot at chunk %d/%d", chunk_idx, total_chunks)
+
+                await asyncio.sleep(sleep_interval)
+
+            # Mark vision context consumed only if the shared image hasn't been
+            # replaced by a newer frame from stream_image() during our async loop.
+            if has_vision and self._latest_image_b64 == snapshot_image_b64:
+                self._proactive_image_consumed = True
+            logger.info("prompt_ephemeral: audio injection complete (%s%s), waiting for VAD → response",
+                         "vision" if has_vision else "general",
+                         "+image" if image_injected else "")
+            return True
+        finally:
+            self._proactive_injecting = False
+
+    async def cancel_response(self) -> None:
+        """Cancel the current response."""
+        event = {
+            "type": "response.cancel"
+        }
+        await self.send_event(event)
+
+    # ------------------------------------------------------------------
+    # Tool calling — execution + result delivery
+    # ------------------------------------------------------------------
+
+    async def _execute_tool_call(self, call: ToolCall) -> ToolResult:
+        """Run the user-supplied ``on_tool_call`` callback and trap any
+        exception so we still return a structured ``ToolResult`` the
+        provider can ingest (model usually recovers from a tool error
+        gracefully)."""
+        if self.on_tool_call is None:
+            msg = "no on_tool_call handler bound"
+            return ToolResult(
+                call_id=call.call_id, name=call.name,
+                output={"error": msg}, is_error=True, error_message=msg,
+            )
+        try:
+            return await self.on_tool_call(call)
+        except Exception as e:
+            logger.exception("OmniRealtimeClient: on_tool_call '%s' raised", call.name)
+            return ToolResult(
+                call_id=call.call_id, name=call.name,
+                output={"error": f"{type(e).__name__}: {e}"},
+                is_error=True, error_message=str(e),
+            )
+
+    async def _send_tool_result_openai_realtime(self, result: ToolResult) -> None:
+        """OpenAI Realtime / GLM Realtime / StepFun / Qwen / Free —
+        send tool result via ``conversation.item.create`` of type
+        ``function_call_output``, then ``response.create``.
+
+        ⚠️ Provider 差异：
+        - OpenAI gpt / StepFun / Qwen / Free：``call_id`` 必传，
+          server 用它把结果绑回对应的 function_call。
+        - GLM：文档示例显示 function_call_output **只有 output 字段**，
+          且服务端的 ``function_call_arguments.done`` 也不带 call_id。
+          我们在 done 事件处合成的 ``glm_<rid>_<idx>`` 仅用于 registry
+          内部追踪，绝对不能回传给 server，否则容易被拒。
+        """
+        item: Dict[str, Any] = {
+            "type": "function_call_output",
+            "output": result.output_as_json_string(),
+        }
+        api = self._api_type.lower()
+        if api == 'glm':
+            # GLM 协议不接受 call_id。哪怕我们内部合成了，也不外传。
+            pass
+        elif result.call_id:
+            item["call_id"] = result.call_id
+        await self.send_event({
+            "type": "conversation.item.create",
+            "item": item,
+        })
+        await self.send_event({"type": "response.create"})
+
+    async def _send_tool_result_gemini(self, results: List[ToolResult]) -> None:
+        """Gemini Live SDK — batch all tool results into one
+        ``send_tool_response`` call (matches the SDK's expectation when
+        the model issues multiple parallel function calls)."""
+        if not self._gemini_session or not results:
+            return
+        if types is None:  # SDK unavailable — should never hit here
+            return
+        function_responses = []
+        for r in results:
+            payload = r.output if isinstance(r.output, dict) else {"result": r.output}
+            kw = {"name": r.name, "response": payload}
+            if r.call_id:
+                kw["id"] = r.call_id
+            function_responses.append(types.FunctionResponse(**kw))
+        try:
+            await self._gemini_session.send_tool_response(function_responses=function_responses)
+        except Exception as e:
+            logger.error("Gemini send_tool_response failed: %s", e)
+    
+    async def _check_repetition(self, response: str) -> bool:
+        """
+        检查回复是否与近期回复高度重复。
+        如果连续3轮都高度重复，返回 True 并触发回调。
+        """
+        
+        # 与最近的回复比较相似度
+        high_similarity_count = 0
+        for recent in self._recent_responses:
+            similarity = calculate_text_similarity(response, recent)
+            if similarity >= self._repetition_threshold:
+                high_similarity_count += 1
+        
+        # 添加到最近回复列表
+        self._recent_responses.append(response)
+        if len(self._recent_responses) > self._max_recent_responses:
+            self._recent_responses.pop(0)
+        
+        # 如果与最近2轮都高度重复（即第3轮重复），触发检测
+        if high_similarity_count >= 2:
+            logger.warning(f"OmniRealtimeClient: 检测到连续{high_similarity_count + 1}轮高重复度对话")
+            
+            # 清空重复检测缓存
+            self._recent_responses.clear()
+            
+            # 触发回调
+            if self.on_repetition_detected:
+                await self.on_repetition_detected()
+            
+            return True
+        
+        return False
+
+    async def handle_interruption(self):
+        """Handle user interruption of the current response."""
+        if not self._is_responding:
+            return
+
+        logger.info("Handling interruption")
+
+        # Mark as interrupted to suppress any remaining output until next response
+        self._interrupted = True
+
+        # 1. Cancel the current response
+        if self._current_response_id:
+            await self.cancel_response()
+
+        self._is_responding = False
+        self._current_response_id = None
+        self._current_item_id = None
+        # 清空转录buffer和重置标志，防止打断后的错位
+        self._output_transcript_buffer = ""
+        self._is_first_transcript_chunk = True
+
+    async def handle_messages(self) -> None:
+        # Gemini uses different message handling
+        if self._is_gemini:
+            await self._handle_messages_gemini()
+            return
+            
+        try:
+            if not self.ws:
+                logger.error("WebSocket connection is not established")
+                return
+                
+            async for message in self.ws:
+                event = json.loads(message)
+                event_type = event.get("type")
+                
+                # if event_type not in ["response.audio.delta", "response.audio_transcript.delta",  "response.output_audio.delta", "response.output_audio_transcript.delta"]:
+                #     # print(f"Received event: {event}")
+                #     print(f"Received event: {event_type}")
+                # else:
+                #     print(f"Event type: {event_type}")
+                if event_type == "error":
+                    error_msg = str(event.get('error', ''))
+                    logger.error(f"API Error: {error_msg}")
+                    
+                    # 检测503过载错误，触发backpressure节流
+                    if '503' in error_msg or 'overloaded' in error_msg.lower():
+                        self._is_throttled = True
+                        self._throttle_until = time.time() + self._throttle_duration
+                        self._server_busy_count += 1
+                        logger.warning(f"⚡ 503 detected (count={self._server_busy_count}), throttling for {self._throttle_duration}s")
+                        # 前2次静默节流，第3次起通知前端
+                        if self._server_busy_count >= 3 and self.on_status_message:
+                            await self.on_status_message(json.dumps({"code": "SERVER_BUSY_THROTTLE"}))
+                        continue
+                    
+                    error_msg_lower = error_msg.lower()
+
+                    # Idle timeout — Qwen 约 25s 无操作断连
+                    if 'too long without operation' in error_msg_lower or 'idle' in error_msg_lower:
+                        logger.warning("⏰ Idle timeout from API: %s", error_msg)
+                        if self.on_connection_error:
+                            await self.on_connection_error(json.dumps({"code": "API_IDLE_TIMEOUT", "details": {"msg": error_msg}}))
+                        await self.close()
+                        continue
+
+                    if ('欠费' in error_msg or 'standing' in error_msg_lower or 'time limit' in error_msg_lower or
+                        'policy violation' in error_msg_lower or '1008' in error_msg_lower or
+                        '429' in error_msg_lower or 'quota' in error_msg_lower or 'too many' in error_msg_lower):
+                        if self.on_connection_error:
+                            await self.on_connection_error(error_msg)
+                        await self.close()
+                    continue
+                # ── Tool calling events ────────────────────────────
+                # Three providers, three flavours of the same idea:
+                #   - OpenAI Realtime (gpt): the canonical event is the
+                #     output_item.done with item.type=="function_call";
+                #     response.done also carries it inside output[].
+                #     Arguments are streamed as
+                #     response.function_call_arguments.delta and finalized
+                #     in response.function_call_arguments.done.
+                #   - StepFun (step / lanlan.tech free): same pattern,
+                #     function_call_arguments.delta + .done with call_id.
+                #   - GLM (glm): only function_call_arguments.done is
+                #     emitted (no delta), and there is no call_id field —
+                #     we synthesize one from response_id+output_index.
+                # All three return results via conversation.item.create
+                # of type function_call_output + response.create, handled
+                # by ``_send_tool_result_openai_realtime``.
+                elif event_type == "response.function_call_arguments.delta":
+                    call_id = event.get("call_id") or ""
+                    if call_id:
+                        slot = self._inflight_tool_args.setdefault(call_id, {
+                            "name": event.get("name") or "",
+                            "arguments": "",
+                        })
+                        if event.get("name"):
+                            slot["name"] = event["name"]
+                        delta = event.get("delta") or ""
+                        if delta:
+                            slot["arguments"] += delta
+                elif event_type == "response.function_call_arguments.done":
+                    name = event.get("name") or ""
+                    raw_args = event.get("arguments") or ""
+                    call_id = event.get("call_id") or ""
+                    if not call_id:
+                        # GLM path: synthesize a stable call_id so we have
+                        # something to thread through the registry.
+                        rid = event.get("response_id") or ""
+                        idx = event.get("output_index", 0)
+                        call_id = f"glm_{rid}_{idx}" if rid else f"glm_call_{int(time.time()*1000)}"
+                    # Prefer accumulated delta args if delta path was used.
+                    accumulated = self._inflight_tool_args.pop(call_id, None)
+                    if accumulated and accumulated.get("arguments"):
+                        raw_args = accumulated["arguments"]
+                        if not name:
+                            name = accumulated.get("name") or name
+                    if not name:
+                        logger.warning(
+                            "function_call_arguments.done with no name (call_id=%s) — skipping",
+                            call_id,
+                        )
+                    elif self.on_tool_call is None:
+                        logger.warning(
+                            "function_call '%s' but no on_tool_call handler bound — replying with error",
+                            name,
+                        )
+                        result = ToolResult(
+                            call_id=call_id, name=name,
+                            output={"error": "no on_tool_call handler"},
+                            is_error=True, error_message="no on_tool_call handler",
+                        )
+                        self._fire_task(self._send_tool_result_openai_realtime(result))
+                    else:
+                        # Execute and reply asynchronously — don't block the
+                        # message loop. handle_messages stays responsive to
+                        # other events while the tool runs.
+                        async def _run_tool(_name=name, _args=raw_args, _cid=call_id):
+                            call = ToolCall(
+                                name=_name,
+                                arguments=parse_arguments_json(_args),
+                                call_id=_cid,
+                                raw_arguments=_args,
+                            )
+                            result = await self._execute_tool_call(call)
+                            await self._send_tool_result_openai_realtime(result)
+                        self._fire_task(_run_tool())
+                elif event_type == "response.done":
+                    self._response_done_total += 1
+                    self._last_response_done_time = time.time()
+                    # 解析实时 API 返回的 token 用量
+                    try:
+                        resp_data = event.get("response", {})
+                        _rt_usage = resp_data.get("usage")
+                        if _rt_usage:
+                            from utils.token_tracker import TokenTracker
+                            TokenTracker.get_instance().record(
+                                model=resp_data.get("model", self.model or "realtime"),
+                                prompt_tokens=_rt_usage.get("input_tokens", 0),
+                                completion_tokens=_rt_usage.get("output_tokens", 0),
+                                total_tokens=_rt_usage.get("total_tokens", 0),
+                                call_type="conversation_realtime",
+                                source="main_logic/omni_realtime_client",
+                            )
+                    except Exception:
+                        pass
+                    self._is_responding = False
+                    self._current_response_id = None
+                    self._current_item_id = None
+                    self._skip_until_next_response = False
+                    self._interrupted = False  # 确保中断标志在响应结束时清除，防止阻塞下一轮 text.delta
+                    # 响应完成，检测重复度
+                    if self._current_response_transcript:
+                        self._last_response_transcript = self._current_response_transcript
+                        print(f"OmniRealtimeClient: response.done - 当前转录: '{self._current_response_transcript[:50]}...' | audio_deltas={self._audio_delta_count}")
+                        await self._check_repetition(self._current_response_transcript)
+                        self._current_response_transcript = ""
+                    else:
+                        self._last_response_transcript = ""
+                        print(f"OmniRealtimeClient: response.done - 没有转录文本 | audio_deltas={self._audio_delta_count}")
+                    self._audio_delta_count = 0
+                    # 确保 buffer 被清空
+                    self._output_transcript_buffer = ""
+                    self._print_input_transcript = False
+                    self._image_recognized_this_turn = False
+                    self._image_sent_this_turn = False
+                    if self.on_response_done:
+                        await self.on_response_done()
+                elif event_type == "response.created":
+                    self._response_created_total += 1
+                    self._last_response_created_time = time.time()
+                    self._current_response_id = event.get("response", {}).get("id")
+                    self._is_responding = True
+                    self._interrupted = False  # Clear interruption flag on new response
+                    self._is_first_text_chunk = self._is_first_transcript_chunk = True
+                    # 清空转录 buffer，防止累积旧内容
+                    self._output_transcript_buffer = ""
+                    self._current_response_transcript = ""  # 重置当前回复转录
+                elif event_type == "response.output_item.added":
+                    self._current_item_id = event.get("item", {}).get("id")
+                elif event_type == "input_audio_buffer.committed":
+                    self._input_audio_committed_total += 1
+                    self._last_input_audio_committed_time = time.time()
+                    logger.info("input_audio_buffer.committed observed (total=%d)", self._input_audio_committed_total)
+                # Handle interruptions
+                elif event_type == "input_audio_buffer.speech_started":
+                    self._speech_started_total += 1
+                    logger.info("Speech detected")
+                    self._audio_in_buffer = True
+                    # 重置静默计时器
+                    self._last_speech_time = time.time()
+                    # Priority 1: server VAD → sync to unified _client_vad_active
+                    self._client_vad_active = True
+                    self._client_vad_last_speech_time = self._last_speech_time
+                    # B: server-VAD 也喂给 _user_recent_activity，保持各 VAD 源对称。
+                    # 但 fudge 注入期间 server 会对我们自己 append 的 fudge 音频
+                    # 回 speech_started —— 这不是真用户活动，若打点 prompt_ephemeral
+                    # 循环会检测到 _user_recent_activity_time > _inject_start 而自 abort，
+                    # 并在之后 8s 内阻塞下一次 fudge（入口 guard 一起被污染）。
+                    if not self._proactive_injecting:
+                        self._user_recent_activity_time = self._last_speech_time
+                    if self._is_responding:
+                        logger.info("Handling interruption")
+                        await self.handle_interruption()
+                elif event_type == "input_audio_buffer.speech_stopped":
+                    self._speech_stopped_total += 1
+                    logger.info("Speech ended")
+                    if self.on_new_message:
+                        await self.on_new_message()
+                    self._audio_in_buffer = False
+                    # Update timestamp so grace period starts from speech end
+                    _now = time.time()
+                    self._client_vad_last_speech_time = _now
+                    # 同 speech_started：fudge 自己的音频结束时 server 也会 emit
+                    # speech_stopped，不能当成真用户活动打点。
+                    if not self._proactive_injecting:
+                        self._user_recent_activity_time = _now
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    self._print_input_transcript = True
+                    transcript = event.get("transcript", "")
+                    if self.on_input_transcript:
+                        await self.on_input_transcript(transcript)
+                elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
+                    self._print_input_transcript = False
+                    if self._output_transcript_buffer and self.on_output_transcript and not self._skip_until_next_response and not self._interrupted:
+                        await self.on_output_transcript(self._output_transcript_buffer, self._is_first_transcript_chunk)
+                        self._is_first_transcript_chunk = False
+                    self._output_transcript_buffer = ""
+
+                if not self._skip_until_next_response and not self._interrupted:
+                    if event_type in ["response.text.delta", "response.output_text.delta"]:
+                        if self.on_text_delta:
+                            if "glm" not in self._model_lower:
+                                self._ai_recent_activity_time = time.time()
+                                await self.on_text_delta(event["delta"], self._is_first_text_chunk)
+                                self._is_first_text_chunk = False
+                    elif event_type in ["response.audio.delta", "response.output_audio.delta"]:
+                        self._audio_delta_count += 1
+                        self._audio_delta_total += 1
+                        self._last_audio_delta_time = time.time()
+                        if self._audio_delta_count == 1:
+                            logger.info(f"🔊 首个 audio.delta 已收到 (type={event_type}, bytes={len(event.get('delta',''))})")
+                        if self.on_audio_delta:
+                            audio_bytes = base64.b64decode(event["delta"])
+                            self._ai_recent_activity_time = time.time()
+                            await self.on_audio_delta(audio_bytes)
+                    elif event_type in ["response.audio_transcript.done", "response.output_audio_transcript.done"]:
+                        if self.on_output_transcript and self._is_first_transcript_chunk:
+                            transcript = event.get("transcript", "")
+                            if transcript:
+                                await self.on_output_transcript(transcript, True)
+                                self._is_first_transcript_chunk = False
+                    elif event_type in ["response.audio_transcript.delta", "response.output_audio_transcript.delta"]:
+                        if self.on_output_transcript:
+                            delta = event.get("delta", "")
+                            # 累积当前回复的转录文本用于重复度检测
+                            self._current_response_transcript += delta
+                            if not self._print_input_transcript:
+                                self._output_transcript_buffer += delta
+                            else:
+                                if self._output_transcript_buffer:
+                                    # logger.info(f"{self._output_transcript_buffer} is_first_chunk: True")
+                                    await self.on_output_transcript(self._output_transcript_buffer, self._is_first_transcript_chunk)
+                                    self._is_first_transcript_chunk = False
+                                    self._output_transcript_buffer = ""
+                                await self.on_output_transcript(delta, self._is_first_transcript_chunk)
+                                self._is_first_transcript_chunk = False
+                    
+                    elif event_type in self.extra_event_handlers:
+                        await self.extra_event_handlers[event_type](event)
+                else:
+                    # 调试日志：text.delta 被 _interrupted/_skip 标志拦截（每个 response 仅记录一次）
+                    if event_type in ["response.text.delta", "response.output_text.delta"]:
+                        if self._suppressed_delta_logged_resp_id != self._current_response_id:
+                            self._suppressed_delta_logged_resp_id = self._current_response_id
+                            logger.warning(
+                                "⚠️ text.delta suppressed: _skip=%s, _interrupted=%s, resp_id=%s",
+                                self._skip_until_next_response, self._interrupted, self._current_response_id
+                            )
+
+        except websockets.exceptions.ConnectionClosedOK:
+            logger.info("Connection closed as expected")
+            self._fatal_error_occurred = True
+            self.ws = None
+        except websockets.exceptions.ConnectionClosedError as e:
+            error_msg = str(e)
+            logger.error(f"Connection closed with error: {error_msg}")
+            self._fatal_error_occurred = True
+            self.ws = None
+            if self.on_connection_error:
+                await self.on_connection_error(error_msg)
+        except asyncio.TimeoutError:
+            if self.ws:
+                await self.ws.close()
+            if self.on_connection_error:
+                await self.on_connection_error(json.dumps({"code": "CONNECTION_TIMEOUT"}))
+        except Exception as e:
+            logger.error(f"Error in message handling: {str(e)}")
+            raise e
+
+    async def close(self) -> None:
+        """Close the WebSocket connection."""
+        # 取消静默检测任务
+        if self._silence_check_task:
+            self._silence_check_task.cancel()
+            try:
+                await self._silence_check_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error cancelling silence check task: {e}")
+            finally:
+                self._silence_check_task = None
+
+        # 重置静默超时相关状态
+        self._silence_timeout_triggered = False
+        self._last_speech_time = None
+        self._silence_reset_pending = False
+        self._last_silence_clear_speech_time = 0.0
+        self._last_local_loud_time = 0.0
+        self._client_vad_active = False
+        self._client_vad_last_speech_time = 0.0
+        self._speech_detect_start = 0.0
+        self._rnnoise_vad_active = False
+        self._user_recent_activity_time = 0.0
+        self._ai_recent_activity_time = 0.0
+
+        # 保存 debug 音频（RNNoise 处理前后的对比音频）
+        if self._audio_processor is not None:
+            try:
+                self._audio_processor.save_debug_audio()
+            except Exception as e:
+                logger.error(f"Error saving debug audio: {e}")
+
+        # 重置音频处理器状态
+        if self._audio_processor is not None:
+            self._audio_processor.reset()
+
+        # Gemini uses different cleanup
+        if self._is_gemini:
+            await self._close_gemini()
+            return
+        
+        if self.ws:
+            try:
+                # 连接时已设 close_timeout=0.5s：远端超时未回 CLOSE 帧时，
+                # websockets 内部会自行 abort transport 强制关闭，
+                # 保证 end_session 快速返回、主事件循环心跳不受影响。
+                await self.ws.close()
+            except Exception as e:
+                logger.error(f"Error closing websocket: {e}")
+            finally:
+                self.ws = None  # 清空引用，防止后续误用
+                logger.info("WebSocket connection closed")
+        else:
+            logger.warning("WebSocket connection is already closed or None")
+    
+    async def _close_gemini(self) -> None:
+        """Close Gemini Live API session."""
+        if self._gemini_context_manager:
+            try:
+                await self._gemini_context_manager.__aexit__(None, None, None)
+            except Exception as e:
+                logger.error(f"Error closing Gemini session: {e}")
+            finally:
+                self._gemini_session = None
+                self._gemini_context_manager = None
+                self.ws = None
+
+                # 重置静默超时相关状态（与普通close()保持一致）
+                self._silence_timeout_triggered = False
+                self._last_speech_time = None
+                self._silence_reset_pending = False
+                self._last_silence_clear_speech_time = 0.0
+                self._last_local_loud_time = 0.0
+                self._client_vad_active = False
+                self._client_vad_last_speech_time = 0.0
+                self._speech_detect_start = 0.0
+                self._rnnoise_vad_active = False
+                self._user_recent_activity_time = 0.0
+                self._ai_recent_activity_time = 0.0
+
+                # 重置音频处理器状态
+                if self._audio_processor is not None:
+                    self._audio_processor.reset()
+
+                logger.info("Gemini Live API session closed")
+    
+    async def _handle_messages_gemini(self) -> None:
+        """Handle messages from Gemini Live API."""
+        if not self._gemini_session:
+            logger.error("Gemini session not established")
+            return
+        
+        try:
+            while not self._fatal_error_occurred:
+                try:
+                    # 接收响应流
+                    turn = self._gemini_session.receive()
+                    async for response in turn:
+                        await self._process_gemini_response(response)
+                    # receive() 是 session 级 async generator，仅在连接断开时退出；
+                    # 正常会话期间此行不会执行。缺失 turn_complete 的兜底已移至
+                    # _process_gemini_response 中基于 model_turn 时间间隔的检测。
+                    self._is_responding = False
+                except asyncio.CancelledError:
+                    logger.info("Gemini message handler cancelled")
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    # 检测正常关闭：包含 "closed" 或者是 WebSocket 1000 正常关闭码
+                    if "closed" in error_msg.lower() or "1000" in error_msg:
+                        logger.info("Gemini session closed")
+                        break
+                    else:
+                        logger.error(f"Error receiving Gemini response: {e}")
+                        if self.on_connection_error:
+                            await self.on_connection_error(error_msg)
+                        break
+        except Exception as e:
+            logger.error(f"Gemini message handler error: {e}")
+    
+    async def _process_gemini_response(self, response) -> None:
+        """Process a single Gemini response event."""
+        try:
+            # 处理工具调用 —— 将 function_calls 中每一个调用都派给
+            # ``on_tool_call``，结果通过 ``send_tool_response`` 一次性回写
+            # （Gemini Live 期望批量回应，而不是逐个）。
+            if hasattr(response, 'tool_call') and response.tool_call:
+                fcs = list(getattr(response.tool_call, 'function_calls', []) or [])
+                if fcs:
+                    if self.on_tool_call is None:
+                        logger.warning(
+                            "Gemini tool_call received but no on_tool_call handler — replying with error"
+                        )
+                        results = [
+                            ToolResult(
+                                call_id=getattr(fc, 'id', '') or '',
+                                name=getattr(fc, 'name', '') or '',
+                                output={"error": "no on_tool_call handler"},
+                                is_error=True, error_message="no on_tool_call handler",
+                            )
+                            for fc in fcs
+                        ]
+                    else:
+                        results = []
+                        for fc in fcs:
+                            args = dict(getattr(fc, 'args', None) or {})
+                            call = ToolCall(
+                                name=getattr(fc, 'name', '') or '',
+                                arguments=args,
+                                call_id=getattr(fc, 'id', '') or '',
+                                raw_arguments=json.dumps(args, ensure_ascii=False),
+                            )
+                            results.append(await self._execute_tool_call(call))
+                    # Fire-and-forget — let the message loop continue. The
+                    # SDK's ``send_tool_response`` is the only way to feed
+                    # results back to a Live session.
+                    self._fire_task(self._send_tool_result_gemini(results))
+                # Tool call cancellation (if present in this SDK build) is
+                # surfaced as ``response.tool_call_cancellation`` — currently
+                # not actioned because we run tools fire-and-forget; if a
+                # cancellation arrives mid-flight the result we eventually
+                # send back will be ignored by the model. Acceptable for
+                # now; revisit if cancel-rate becomes a problem.
+            
+            # 检查是否有服务器内容
+            if response.server_content:
+                server_content = response.server_content
+                
+                # 处理用户输入转录 - 只累积，不立即发送（避免碎片化显示）
+                if hasattr(server_content, 'input_transcription') and server_content.input_transcription:
+                    input_trans = server_content.input_transcription
+                    if hasattr(input_trans, 'text') and input_trans.text:
+                        self._gemini_user_transcript += input_trans.text
+                
+                # 检查是否有 AI 内容（model_turn 或 output_transcription）
+                has_ai_content = (
+                    server_content.model_turn or 
+                    (hasattr(server_content, 'output_transcription') and server_content.output_transcription)
+                )
+                
+                # ⚠️ 重要：检测 turn 开始 - 无论是 model_turn 还是 output_transcription 先到
+                if has_ai_content and not self._is_responding:
+                    # 区分"真新 turn"与"上个 turn 的迟到帧"。双判据合取：
+                    #   A. 用户在 AI 最后一帧之后发过声 → 必然新 turn（back-and-forth）
+                    #   B. AI 最后一帧距今超过 window → 静默够久也算新 turn
+                    # 仅当两条都不满足（短静默 + 用户全程没发声）才视为
+                    # late continuation —— 这正是 Gemini turn_complete 抢跑的迟到
+                    # 音频、或同一长回复被拆 sub-turn 的场景。
+                    # 早期版本只用时间窗，会把快速一问一答（AI→用户→AI in <3s）
+                    # 误判 late continuation 导致气泡合并 / user_transcript flush 延迟
+                    # （Codex P1 反馈）。加用户发声比较后合并两种场景均正确。
+                    _user_spoke_after_ai = (
+                        self._user_recent_activity_time > self._ai_recent_activity_time
+                    )
+                    _still_within_ai_window = (
+                        self._ai_recent_activity_time > 0
+                        and time.time() - self._ai_recent_activity_time
+                        <= self._ai_recent_activity_window
+                    )
+                    _is_new_turn = _user_spoke_after_ai or not _still_within_ai_window
+                    self._is_responding = True
+                    if _is_new_turn:
+                        # 在AI开始响应前，发送累积的用户输入
+                        if self._gemini_user_transcript and self.on_input_transcript:
+                            await self.on_input_transcript(self._gemini_user_transcript)
+                            self._gemini_user_transcript = ""  # 清空累积
+                        self._is_first_text_chunk = True  # 重置第一个 chunk 标记
+                        self._gemini_current_transcript = ""  # 清空累积
+                        if not self._skip_until_next_response and not self._interrupted and self.on_new_message:
+                            await self.on_new_message()
+                    else:
+                        logger.debug(
+                            "Gemini: late content after premature turn_complete (%.2fs ago), treating as continuation",
+                            time.time() - self._ai_recent_activity_time,
+                        )
+
+                # 处理输出转录 - 流式发送每个 chunk 到前端
+                # 不参与新 turn 检测；turn_complete 后到达的迟到转录会以 isNewMessage=false
+                # 追加到当前轮次的气泡（正确行为）
+                if hasattr(server_content, 'output_transcription') and server_content.output_transcription:
+                    output_trans = server_content.output_transcription
+                    if hasattr(output_trans, 'text') and output_trans.text:
+                        text = output_trans.text
+                        self._gemini_current_transcript += text
+                        if not self._skip_until_next_response and not self._interrupted and self.on_text_delta:
+                            self._ai_recent_activity_time = time.time()
+                            await self.on_text_delta(text, self._is_first_text_chunk)
+                            self._is_first_text_chunk = False
+
+                # 处理模型输出 (音频)
+                if server_content.model_turn:
+                    for part in server_content.model_turn.parts:
+                        # 跳过 thinking/thought 部分
+                        if hasattr(part, 'thought') and part.thought:
+                            continue
+
+                        # 处理音频
+                        if hasattr(part, 'inline_data') and part.inline_data:
+                            if isinstance(part.inline_data.data, bytes):
+                                if not self._skip_until_next_response and not self._interrupted and self.on_audio_delta:
+                                    self._ai_recent_activity_time = time.time()
+                                    await self.on_audio_delta(part.inline_data.data)
+
+                # 检查是否 turn 完成（用 getattr 防止 SDK 无该字段时抛错）
+                if getattr(server_content, 'turn_complete', False):
+                    # Gemini Live API 不返回 token 数，仅记录调用次数
+                    try:
+                        from utils.token_tracker import TokenTracker
+                        TokenTracker.get_instance().record(
+                            model=self.model or "gemini-live",
+                            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                            call_type="conversation_realtime_gemini",
+                            source="main_logic/omni_realtime_client",
+                        )
+                    except Exception:
+                        pass
+                    self._is_responding = False
+                    if self._skip_until_next_response:
+                        self._skip_until_next_response = False
+                        logger.info("Gemini: skipped response (prime_context priming)")
+                    elif self.on_response_done:
+                        await self.on_response_done()
+                
+                # 检查是否被中断
+                if hasattr(server_content, 'interrupted') and server_content.interrupted:
+                    if self._skip_until_next_response:
+                        self._skip_until_next_response = False
+                        logger.info("Gemini: skipped response interrupted, reset skip flag")
+                    self._interrupted = True
+                    self._is_responding = False
+                    # 被中断时也发送已累积的用户输入
+                    if self._gemini_user_transcript and self.on_input_transcript:
+                        await self.on_input_transcript(self._gemini_user_transcript)
+                        self._gemini_user_transcript = ""
+                    logger.info("Gemini response was interrupted by user")
+        
+        except Exception as e:
+            logger.error(f"Error processing Gemini response: {e}")

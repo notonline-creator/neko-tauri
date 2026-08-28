@@ -1,0 +1,1 @@
+{"root":["./src/app.test.tsx","./src/app.tsx","./src/messagebubble.tsx","./src/messagelist.tsx","./src/smarttextblock.test.tsx","./src/smarttextblock.tsx","./src/export.ts","./src/i18n.ts","./src/main.tsx","./src/message-schema.test.ts","./src/message-schema.ts","./src/mount.tsx","./src/vite-env.d.ts","./src/test/setup.ts"],"version":"5.9.3"}

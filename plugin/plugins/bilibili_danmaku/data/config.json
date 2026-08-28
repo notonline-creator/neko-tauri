@@ -1,0 +1,8 @@
+{
+  "room_id": 0,
+  "interval_seconds": 15,
+  "target_lanlan": "",
+  "danmaku_max_length": 20,
+  "master_bili_uid": 0,
+  "master_bili_name": ""
+}

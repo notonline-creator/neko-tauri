@@ -1,0 +1,1376 @@
+// 允许的来源列表
+const ALLOWED_ORIGINS = [window.location.origin];
+const MINIMAX_PREFIX_MAX_LENGTH = 10;
+let workshopReferenceFile = null;
+let workshopReferenceAudioUrl = '';
+let providerTouchedByUser = false;
+let suppressProviderTouchedTracking = false;
+// 防止并发应用音色的可重入守卫
+let isApplyingVoice = false;
+
+// 打开API设置页（带弹窗拦截回退）
+function openApiSettings() {
+    const features = 'width=820,height=700,scrollbars=yes,resizable=yes';
+    const win = typeof window.openOrFocusWindow === 'function'
+        ? window.openOrFocusWindow('/api_key', 'apiSettings', features)
+        : window.open('/api_key', 'apiSettings', features);
+    if (win) {
+        const modal = document.getElementById('noApiModal');
+        if (modal) modal.style.display = 'none';
+    } else {
+        location.href = '/api_key';
+    }
+}
+
+// 安全地解析 fetch 响应：当后端/反向代理返回 HTML（404/502/504/网关错误等）时
+// 不应抛出 "Unexpected token '<', '<html>...' is not valid JSON"，而应返回带状态码的可读错误。
+async function safeReadResponse(res) {
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    // 识别 application/json 以及 RFC 6839 的结构化后缀（如 application/problem+json,
+    // application/vnd.api+json 等），它们都是合法 JSON。
+    const isJsonContentType = contentType.includes('application/json') || /\+json(\s*;|\s*$)/.test(contentType);
+    if (isJsonContentType) {
+        try {
+            return { data: await res.json(), nonJson: false, text: '' };
+        } catch (_) {
+            // Content-Type 声明 JSON 但解析失败，落到文本分支
+        }
+    }
+    let text = '';
+    try { text = await res.text(); } catch (_) { text = ''; }
+    return { data: null, nonJson: true, text };
+}
+
+function buildNonJsonError(res, text) {
+    // 去除 HTML 标签并截断，避免把整段 HTML 报告给用户
+    const snippet = text
+        ? text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)
+        : '';
+    if (window.t) {
+        if (res.status === 404) {
+            return window.t('voice.serverRouteNotFound', { status: res.status });
+        }
+        return window.t('voice.serverNonJsonError', {
+            status: res.status,
+            snippet: snippet || res.statusText || ''
+        });
+    }
+    if (res.status === 404) {
+        return `接口未找到 (HTTP 404)，请确认服务端已正确部署并重启`;
+    }
+    return `服务端返回了非JSON响应 (HTTP ${res.status})${snippet ? ': ' + snippet : ''}`;
+}
+
+// 把后端错误响应体转成可读消息：
+// 只有在 errors.<code> 翻译确实存在时才使用 i18n，否则回退到响应自带文案，
+// 避免 i18next 的「缺失 key 回退成 key 本身」行为把 "errors.XXX_UNKNOWN" 直接丢给用户。
+function resolveBackendErrorMsg(data, status) {
+    if (data && data.code && window.t) {
+        const i18nKey = 'errors.' + data.code;
+        const translated = window.t(i18nKey, data.details || {});
+        if (translated && translated !== i18nKey) {
+            return translated;
+        }
+    }
+    return (data && (data.detail || data.message || data.error)) || `API returned ${status}`;
+}
+
+function appendVoiceApplyStatus(resultDiv, message, className = '') {
+    if (!resultDiv) return;
+    if (resultDiv.textContent || resultDiv.childNodes.length) {
+        resultDiv.appendChild(document.createElement('br'));
+    }
+    const statusSpan = document.createElement('span');
+    if (className) statusSpan.className = className;
+    statusSpan.textContent = message;
+    resultDiv.appendChild(statusSpan);
+}
+
+function notifyVoiceIdUpdated(voiceId, lanlanName, sessionRestarted) {
+    const payload = { type: 'voice_id_updated', voice_id: voiceId, lanlan_name: lanlanName, session_restarted: sessionRestarted };
+    if (window.parent !== window) {
+        try { window.parent.postMessage(payload, window.location.origin); } catch (e) { }
+    }
+    if (window.opener && !window.opener.closed) {
+        try { window.opener.postMessage(payload, window.location.origin); } catch (e) { }
+    }
+}
+
+function createVoiceConfigSwitchOpId(lanlanName) {
+    return 'voice-config-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8) + '-' + (lanlanName || 'current');
+}
+
+function notifyVoiceConfigSwitching(lanlanName, active, opId) {
+    const payload = {
+        action: 'voice_config_switching',
+        type: 'voice_config_switching',
+        active: !!active,
+        op_id: opId || '',
+        lanlan_name: lanlanName || '',
+        timestamp: Date.now()
+    };
+
+    if (typeof BroadcastChannel !== 'undefined') {
+        try {
+            const channel = new BroadcastChannel('neko_page_channel');
+            channel.postMessage(payload);
+            setTimeout(() => channel.close(), 1000);
+        } catch (_) { /* 跨窗口同步失败时继续走 postMessage 兜底 */ }
+    }
+
+    if (window.nekoElectronVoiceConfigSwitching && typeof window.nekoElectronVoiceConfigSwitching.send === 'function') {
+        try { window.nekoElectronVoiceConfigSwitching.send(payload); } catch (_) { }
+    }
+
+    if (window.parent !== window) {
+        try { window.parent.postMessage(payload, window.location.origin); } catch (_) { }
+    }
+    if (window.opener && !window.opener.closed) {
+        try { window.opener.postMessage(payload, window.location.origin); } catch (_) { }
+    }
+}
+
+async function saveVoiceIdToCurrentCharacter(voiceId) {
+    const lanlanInput = document.getElementById('lanlan_name');
+    const lanlanName = (lanlanInput && lanlanInput.value ? lanlanInput.value : '').trim();
+    if (!lanlanName) {
+        throw new Error(window.t ? window.t('voice.noCurrentCharacterForApply') : '未找到当前角色，无法应用音色');
+    }
+
+    const switchOpId = createVoiceConfigSwitchOpId(lanlanName);
+    notifyVoiceConfigSwitching(lanlanName, true, switchOpId);
+    let resp;
+    try {
+        resp = await fetch(`/api/characters/catgirl/voice_id/${encodeURIComponent(lanlanName)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ voice_id: voiceId })
+        });
+    } finally {
+        notifyVoiceConfigSwitching(lanlanName, false, switchOpId);
+    }
+    const { data, nonJson, text } = await safeReadResponse(resp);
+    if (!resp.ok) {
+        if (data && (data.error || data.detail)) {
+            throw new Error(data.error || data.detail);
+        }
+        throw new Error(buildNonJsonError(resp, text));
+    }
+    if (nonJson) {
+        throw new Error(buildNonJsonError(resp, text));
+    }
+    if (!data || data.success === false) {
+        throw new Error((data && data.error) || (window.t ? window.t('common.unknownError') : '未知错误'));
+    }
+    notifyVoiceIdUpdated(voiceId, lanlanName, data.session_restarted);
+    return { lanlanName, result: data };
+}
+
+async function getCurrentCharacterVoiceId() {
+    const lanlanInput = document.getElementById('lanlan_name');
+    const lanlanName = (lanlanInput && lanlanInput.value ? lanlanInput.value : '').trim();
+    if (!lanlanName) return '';
+
+    const resp = await fetch('/api/characters?language=zh-CN', { cache: 'no-store' });
+    const { data, nonJson, text } = await safeReadResponse(resp);
+    if (!resp.ok) {
+        if (data && (data.error || data.detail)) {
+            throw new Error(data.error || data.detail);
+        }
+        throw new Error(buildNonJsonError(resp, text));
+    }
+    if (nonJson) {
+        throw new Error(buildNonJsonError(resp, text));
+    }
+
+    const catgirls = data && data['猫娘'];
+    const currentCatgirl = catgirls && catgirls[lanlanName];
+    if (!currentCatgirl || typeof currentCatgirl !== 'object') return '';
+    return String(currentCatgirl.voice_id || '').trim();
+}
+
+function markSelectedVoiceItem(item, selected) {
+    if (!item) return;
+    item.classList.toggle('selected', !!selected);
+    item.setAttribute('aria-pressed', selected ? 'true' : 'false');
+}
+
+async function applyVoiceToCurrentCharacter(voiceId, displayName, item) {
+    if (!voiceId) return;
+    if (isApplyingVoice) return;
+    isApplyingVoice = true;
+
+    const resultDiv = document.getElementById('result');
+    const refreshBtn = document.getElementById('refresh-voices-btn');
+    const voiceItems = document.querySelectorAll('.voice-list-item');
+    const previousSelectedVoiceIds = new Set(
+        Array.from(voiceItems)
+            .filter(node => node.classList.contains('selected'))
+            .map(node => node.dataset.voiceId || '')
+            .filter(Boolean)
+    );
+
+    voiceItems.forEach(node => {
+        node.classList.remove('applying', 'selected');
+        node.setAttribute('aria-pressed', 'false');
+    });
+    if (item) item.classList.add('applying');
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    if (resultDiv) {
+        resultDiv.className = 'result';
+        resultDiv.textContent = window.t ? window.t('voice.applyingVoice', { name: displayName || voiceId }) : `正在应用音色「${displayName || voiceId}」...`;
+    }
+
+    try {
+        const { result } = await saveVoiceIdToCurrentCharacter(voiceId);
+        if (item) {
+            item.classList.remove('applying');
+            markSelectedVoiceItem(item, true);
+        }
+        if (resultDiv) {
+            resultDiv.className = 'result';
+            resultDiv.textContent = window.t ? window.t('voice.applyVoiceSuccess', { name: displayName || voiceId }) : `已将音色「${displayName || voiceId}」应用到当前角色`;
+            const statusText = result.session_restarted
+                ? (window.t ? window.t('voice.pageWillRefresh') : '当前页面即将自动刷新以应用新语音')
+                : (window.t ? window.t('voice.voiceWillTakeEffect') : '新语音将在下次对话时生效');
+            appendVoiceApplyStatus(resultDiv, statusText);
+        }
+    } catch (e) {
+        if (item) item.classList.remove('applying');
+        voiceItems.forEach(node => markSelectedVoiceItem(node, previousSelectedVoiceIds.has(node.dataset.voiceId || '')));
+        const errorMsg = e?.message || e?.toString() || (window.t ? window.t('common.unknownError') : '未知错误');
+        if (resultDiv) {
+            resultDiv.className = 'result error';
+            resultDiv.textContent = window.t ? window.t('voice.applyVoiceFailed', { error: errorMsg }) : `应用音色失败：${errorMsg}`;
+        }
+    } finally {
+        isApplyingVoice = false;
+        if (refreshBtn) refreshBtn.disabled = false;
+    }
+}
+
+function parseVoiceRegisterError(errorObj) {
+    const errorCode = errorObj?.code;
+    const errorMsg = errorObj?.message || errorObj?.error || errorObj || '';
+    let displayError = errorMsg;
+    let shouldFlash = false;
+
+    if (errorCode === 'PREFIX_INVALID') {
+        displayError = window.t ? window.t('voice.prefixShouldBeEnglishLetterAndNumber') : '前缀应为英文字母和数字';
+        shouldFlash = true;
+    } else if (errorCode === 'INVALID_API_KEY') {
+        displayError = window.t ? window.t('voice.invalidApiKeyProvided') : '提供的API密钥无效';
+        shouldFlash = true;
+    } else {
+        const lowerMsg = errorMsg.toLowerCase();
+        if (lowerMsg.includes('prefix should be') && lowerMsg.includes('english letter and number')) {
+            displayError = window.t ? window.t('voice.prefixShouldBeEnglishLetterAndNumber') : '前缀应为英文字母和数字';
+            shouldFlash = true;
+        } else if (lowerMsg.includes('invalid api-key provided')) {
+            displayError = window.t ? window.t('voice.invalidApiKeyProvided') : '提供的API密钥无效';
+            shouldFlash = true;
+        }
+    }
+
+    return { displayError, shouldFlash };
+}
+
+function isMiniMaxProvider(provider) {
+    return provider === 'minimax' || provider === 'minimax_intl';
+}
+
+function sanitizeMiniMaxPrefix(prefix) {
+    return String(prefix || '')
+        .replace(/[^0-9a-z]/gi, '')
+        .slice(0, MINIMAX_PREFIX_MAX_LENGTH);
+}
+
+function normalizePrefixInputForProvider() {
+    const prefixInput = document.getElementById('prefix');
+    const provider = (document.getElementById('voiceProvider') || {}).value || 'cosyvoice';
+    if (!prefixInput) {
+        return '';
+    }
+
+    if (!isMiniMaxProvider(provider)) {
+        prefixInput.removeAttribute('maxlength');
+        return prefixInput.value.trim();
+    }
+
+    prefixInput.maxLength = MINIMAX_PREFIX_MAX_LENGTH;
+    const trimmedValue = prefixInput.value.trim();
+    const sanitized = sanitizeMiniMaxPrefix(trimmedValue);
+    if (trimmedValue !== sanitized || prefixInput.value !== sanitized) {
+        prefixInput.value = sanitized;
+    }
+    return sanitized;
+}
+
+function guessAudioMimeType(filename) {
+    return /\.mp3$/i.test(filename || '') ? 'audio/mpeg' : 'audio/wav';
+}
+
+function getEffectiveAudioFile() {
+    const fileInput = document.getElementById('audioFile');
+    if (fileInput && fileInput.files && fileInput.files.length) {
+        return fileInput.files[0];
+    }
+    return workshopReferenceFile;
+}
+
+function setWorkshopVoiceSourceStatus(message, isError = false) {
+    const statusEl = document.getElementById('workshopVoiceSourceStatus');
+    if (!statusEl) return;
+    statusEl.textContent = message || '';
+    statusEl.style.display = message ? 'block' : 'none';
+    statusEl.classList.toggle('error', !!message && isError);
+}
+
+function revokeWorkshopReferenceAudioUrl() {
+    if (workshopReferenceAudioUrl) {
+        URL.revokeObjectURL(workshopReferenceAudioUrl);
+        workshopReferenceAudioUrl = '';
+    }
+}
+
+function applyWorkshopProviderHint(providerHint) {
+    const providerSelect = document.getElementById('voiceProvider');
+    if (!providerSelect || !providerHint) return;
+    if (providerTouchedByUser) return;
+    if (providerSelect.value !== 'cosyvoice') return;
+
+    suppressProviderTouchedTracking = true;
+    providerSelect.value = providerHint;
+    providerSelect.dispatchEvent(new Event('change'));
+    suppressProviderTouchedTracking = false;
+}
+
+window.addEventListener('beforeunload', revokeWorkshopReferenceAudioUrl);
+
+// 关闭页面函数
+function closeVoiceClonePage() {
+    if (window.opener) {
+        // 如果是通过 window.open() 打开的，直接关闭
+        window.close();
+    } else if (window.parent && window.parent !== window) {
+        // 如果在 iframe 中，通知父窗口关闭
+        window.parent.postMessage({ type: 'close_voice_clone' }, window.location.origin);
+    } else {
+        // 否则尝试关闭窗口
+        // 注意：如果是用户直接访问的页面，浏览器可能不允许关闭
+        // 在这种情况下，可以尝试返回上一页或显示提示
+        if (window.history.length > 1) {
+            window.history.back();
+        } else {
+            window.close();
+            // 如果 window.close() 失败（页面仍然存在），可以显示提示
+            setTimeout(() => {
+                if (!window.closed) {
+                    // 窗口未能关闭，返回主页
+                    window.location.href = '/';
+                }
+            }, 100);
+        }
+    }
+}
+
+// 更新文件选择显示
+function updateFileDisplay() {
+    const fileInput = document.getElementById('audioFile');
+    const fileNameDisplay = document.getElementById('fileNameDisplay');
+    if (!fileInput || !fileNameDisplay) {
+        return; // 如果元素不存在，直接返回
+    }
+    if (fileInput.files.length > 0) {
+        fileNameDisplay.textContent = fileInput.files[0].name;
+    } else if (workshopReferenceFile) {
+        const workshopPreloadedSuffix = (window.t && typeof window.t === 'function')
+            ? window.t('voice.workshopPreloaded')
+            : '（创意工坊预载入）';
+        fileNameDisplay.textContent = `${workshopReferenceFile.name}${workshopPreloadedSuffix}`;
+    } else {
+        fileNameDisplay.textContent = window.t ? window.t('voice.noFileSelected') : '未选择文件';
+    }
+}
+
+// 监听文件选择变化
+document.addEventListener('DOMContentLoaded', () => {
+    const audioFile = document.getElementById('audioFile');
+    if (audioFile) {
+        audioFile.addEventListener('change', updateFileDisplay);
+    } else {
+        console.error('未找到 audioFile 元素');
+    }
+});
+
+// 更新文件选择按钮的 data-text 属性（用于文字描边效果）
+function updateFileButtonText() {
+    const fileText = document.querySelector('.file-text');
+    if (fileText) {
+        const text = fileText.textContent || fileText.innerText;
+        fileText.setAttribute('data-text', text);
+    }
+}
+
+// 更新注册音色按钮的 data-text 属性（用于文字描边效果）
+function updateRegisterButtonText() {
+    const registerText = document.querySelector('.register-text');
+    if (registerText) {
+        const text = registerText.textContent || registerText.innerText;
+        registerText.setAttribute('data-text', text);
+    }
+}
+
+// 监听 i18n 更新事件，同步更新 data-text
+if (window.i18n) {
+    window.i18n.on('languageChanged', function () {
+        updateFileButtonText();
+        updateRegisterButtonText();
+    });
+    // 监听所有翻译更新
+    const originalChangeLanguage = window.i18n.changeLanguage;
+    if (originalChangeLanguage) {
+        window.i18n.changeLanguage = function (...args) {
+            const result = originalChangeLanguage.apply(this, args);
+            if (result && typeof result.then === 'function') {
+                result.then(() => {
+                    setTimeout(() => {
+                        updateFileButtonText();
+                        updateRegisterButtonText();
+                    }, 100);
+                });
+            } else {
+                setTimeout(() => {
+                    updateFileButtonText();
+                    updateRegisterButtonText();
+                }, 100);
+            }
+            return result;
+        };
+    }
+}
+
+// 使用 MutationObserver 监听文字内容变化
+const fileTextObserver = new MutationObserver(function (mutations) {
+    mutations.forEach(function (mutation) {
+        if (mutation.type === 'childList' || mutation.type === 'characterData') {
+            updateFileButtonText();
+        }
+    });
+});
+
+const registerTextObserver = new MutationObserver(function (mutations) {
+    mutations.forEach(function (mutation) {
+        if (mutation.type === 'childList' || mutation.type === 'characterData') {
+            updateRegisterButtonText();
+        }
+    });
+});
+
+// 页面加载时更新文件选择显示
+// 如果 i18next 已经初始化完成，立即更新
+if (window.i18n && window.i18n.isInitialized) {
+    updateFileDisplay();
+    updateFileButtonText();
+    updateRegisterButtonText();
+    const fileText = document.querySelector('.file-text');
+    if (fileText) {
+        fileTextObserver.observe(fileText, {
+            childList: true,
+            characterData: true,
+            subtree: true
+        });
+    }
+    const registerText = document.querySelector('.register-text');
+    if (registerText) {
+        registerTextObserver.observe(registerText, {
+            childList: true,
+            characterData: true,
+            subtree: true
+        });
+    }
+} else {
+    // 延迟更新，等待 i18next 初始化
+    setTimeout(() => {
+        updateFileDisplay();
+        updateFileButtonText();
+        updateRegisterButtonText();
+        const fileText = document.querySelector('.file-text');
+        if (fileText) {
+            fileTextObserver.observe(fileText, {
+                childList: true,
+                characterData: true,
+                subtree: true
+            });
+        }
+        const registerText = document.querySelector('.register-text');
+        if (registerText) {
+            registerTextObserver.observe(registerText, {
+                childList: true,
+                characterData: true,
+                subtree: true
+            });
+        }
+    }, 500);
+}
+
+// 页面加载时获取 lanlan_name
+(async function initLanlanName() {
+    // Electron白屏修复
+    if (document.body) {
+        void document.body.offsetHeight;
+        const currentOpacity = document.body.style.opacity || '1';
+        document.body.style.opacity = '0.99';
+        requestAnimationFrame(() => {
+            document.body.style.opacity = currentOpacity;
+        });
+    }
+
+    const lanlanInput = document.getElementById('lanlan_name');
+
+    try {
+        // 优先从 URL 获取 lanlan_name
+        const urlParams = new URLSearchParams(window.location.search);
+        let lanlanName = urlParams.get('lanlan_name') || "";
+
+        // 如果 URL 中没有，从 API 获取
+        if (!lanlanName) {
+            const response = await fetch('/api/config/page_config');
+            if (!response.ok) {
+                throw new Error(`API returned ${response.status}`);
+            }
+            const data = await response.json();
+            if (data.success) {
+                lanlanName = data.lanlan_name || "";
+            }
+        }
+
+        // 设置到隐藏字段
+        if (lanlanInput) {
+            lanlanInput.value = lanlanName;
+        }
+        // lanlan_name 就绪后再刷新音色列表，确保当前音色选中态正确
+        if (typeof loadVoices === 'function') {
+            try { await loadVoices(); } catch (_) { /* 静默忽略二次加载错误 */ }
+        }
+    } catch (error) {
+        console.error('获取 lanlan_name 失败:', error);
+        if (lanlanInput) {
+            lanlanInput.value = "";
+        }
+    }
+
+    // 检查是否已设置可用于克隆的API Key
+    try {
+        const resp = await fetch('/api/config/core_api');
+        if (resp.ok) {
+            const cfg = await resp.json();
+            if (!cfg || cfg.success === false) {
+                console.warn('获取核心配置失败:', cfg?.error);
+            } else {
+                // 本地TTS服务器(ws/wss协议)不需要云端API Key
+                const ttsUrl = cfg.ttsModelUrl || '';
+                const isLocalTts = cfg.enableCustomApi && (ttsUrl.startsWith('ws://') || ttsUrl.startsWith('wss://'));
+                const hasCloneApi = isLocalTts || !!(cfg.assistApiKeyQwen || cfg.assistApiKeyMinimax || cfg.assistApiKeyMinimaxIntl);
+                if (!hasCloneApi) {
+                    const modal = document.getElementById('noApiModal');
+                    if (modal) modal.style.display = 'flex';
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('检查克隆API Key失败:', e);
+    }
+
+    await initWorkshopVoiceReference();
+})();
+
+// 服务商切换时更新提示横幅
+document.addEventListener('DOMContentLoaded', function initProviderSwitch() {
+    const providerSelect = document.getElementById('voiceProvider');
+    const noticeDiv = document.getElementById('provider-notice');
+    const prefixInput = document.getElementById('prefix');
+    if (!providerSelect || !noticeDiv) return;
+
+    function updateNotice() {
+        const provider = providerSelect.value;
+        const span = noticeDiv.querySelector('span');
+        if (!span) return;
+
+        const keyMap = {
+            'minimax': 'voice.minimaxApiRequired',
+            'minimax_intl': 'voice.minimaxIntlApiRequired',
+        };
+        const i18nKey = keyMap[provider] || 'voice.alibabaApiRequired';
+        span.setAttribute('data-i18n', i18nKey);
+        if (window.t) {
+            span.textContent = window.t(i18nKey);
+        }
+        // 若 window.t 不可用，保留 HTML 中的原始文本，不覆盖
+    }
+
+    providerSelect.addEventListener('change', () => {
+        if (!suppressProviderTouchedTracking) {
+            providerTouchedByUser = true;
+        }
+        updateNotice();
+        normalizePrefixInputForProvider();
+    });
+    if (prefixInput) {
+        prefixInput.addEventListener('input', () => {
+            normalizePrefixInputForProvider();
+        });
+    }
+    updateNotice();
+    normalizePrefixInputForProvider();
+});
+
+// 当前克隆方式
+let currentCloneMethod = 'file';
+
+// 切换克隆方式
+function switchCloneMethod(method) {
+    currentCloneMethod = method;
+    const btnFileClone = document.getElementById('btnFileClone');
+    const btnDirectLinkClone = document.getElementById('btnDirectLinkClone');
+    const fileCloneSection = document.getElementById('fileCloneSection');
+    const directLinkCloneSection = document.getElementById('directLinkCloneSection');
+
+    if (!btnFileClone || !btnDirectLinkClone || !fileCloneSection || !directLinkCloneSection) {
+        console.warn('克隆方式切换：部分DOM元素未找到');
+        return;
+    }
+
+    if (method === 'file') {
+        btnFileClone.classList.add('active');
+        btnFileClone.setAttribute('aria-selected', 'true');
+        btnFileClone.setAttribute('tabindex', '0');
+        btnDirectLinkClone.classList.remove('active');
+        btnDirectLinkClone.setAttribute('aria-selected', 'false');
+        btnDirectLinkClone.setAttribute('tabindex', '-1');
+        fileCloneSection.style.display = 'block';
+        directLinkCloneSection.style.display = 'none';
+    } else {
+        btnFileClone.classList.remove('active');
+        btnFileClone.setAttribute('aria-selected', 'false');
+        btnFileClone.setAttribute('tabindex', '-1');
+        btnDirectLinkClone.classList.add('active');
+        btnDirectLinkClone.setAttribute('aria-selected', 'true');
+        btnDirectLinkClone.setAttribute('tabindex', '0');
+        fileCloneSection.style.display = 'none';
+        directLinkCloneSection.style.display = 'block';
+    }
+}
+
+async function initWorkshopVoiceReference() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const workshopItemId = urlParams.get('workshop_item_id');
+    const source = urlParams.get('source');
+    if (!workshopItemId || source !== 'workshop') {
+        return;
+    }
+
+    const sourceCard = document.getElementById('workshopVoiceSource');
+    const sourceTitle = document.getElementById('workshopVoiceSourceTitle');
+    const sourceMeta = document.getElementById('workshopVoiceSourceMeta');
+    const previewAudio = document.getElementById('workshopVoicePreview');
+    const t = (key, fallback, options) => window.t ? window.t(key, options) : fallback;
+    const workshopSourceTitleText = t('voice.workshopSourceTitle', 'Workshop Reference Voice');
+    if (!sourceCard || !sourceTitle || !sourceMeta || !previewAudio) {
+        return;
+    }
+
+    sourceCard.style.display = 'block';
+    sourceTitle.textContent = workshopSourceTitleText;
+    sourceMeta.textContent = '';
+    setWorkshopVoiceSourceStatus(t('voice.workshopSourceLoading', 'Loading workshop reference voice...'));
+
+    try {
+        const manifestResponse = await fetch(`/api/steam/workshop/voice-reference/${encodeURIComponent(workshopItemId)}`);
+        const manifestData = await manifestResponse.json();
+        if (!manifestResponse.ok) {
+            throw new Error(manifestData.error || `HTTP ${manifestResponse.status}`);
+        }
+        if (!manifestData.available || !manifestData.manifest) {
+            throw new Error(t('voice.workshopSourceUnavailable', 'This workshop item has no available reference voice.'));
+        }
+
+        const audioResponse = await fetch(`/api/steam/workshop/voice-reference/${encodeURIComponent(workshopItemId)}/audio`);
+        if (!audioResponse.ok) {
+            const errorData = await audioResponse.json().catch(() => ({}));
+            throw new Error(errorData.error || `HTTP ${audioResponse.status}`);
+        }
+
+        const manifest = manifestData.manifest;
+        const audioBlob = await audioResponse.blob();
+        workshopReferenceFile = new File(
+            [audioBlob],
+            manifest.reference_audio,
+            { type: audioBlob.type || guessAudioMimeType(manifest.reference_audio) }
+        );
+        revokeWorkshopReferenceAudioUrl();
+        workshopReferenceAudioUrl = URL.createObjectURL(audioBlob);
+
+        sourceTitle.textContent = manifestData.title || manifest.display_name || workshopSourceTitleText;
+        sourceMeta.textContent = t('voice.workshopSourceMeta', 'Sample: {{sample}} | Prefix: {{prefix}} | Language: {{language}}', {
+            sample: manifest.display_name || manifest.reference_audio,
+            prefix: manifest.prefix,
+            language: manifest.ref_language
+        });
+        previewAudio.src = workshopReferenceAudioUrl;
+        previewAudio.style.display = 'block';
+        setWorkshopVoiceSourceStatus(t('voice.workshopSourceReady', 'Reference voice preloaded. Submission will use the file upload clone flow.'));
+
+        switchCloneMethod('file');
+        const prefixInput = document.getElementById('prefix');
+        const refLanguageSelect = document.getElementById('refLanguage');
+        if (prefixInput) prefixInput.value = manifest.prefix || '';
+        if (refLanguageSelect) refLanguageSelect.value = manifest.ref_language || 'ch';
+        applyWorkshopProviderHint(manifest.provider_hint);
+        updateFileDisplay();
+    } catch (error) {
+        workshopReferenceFile = null;
+        revokeWorkshopReferenceAudioUrl();
+        sourceTitle.textContent = workshopSourceTitleText;
+        sourceMeta.textContent = '';
+        previewAudio.removeAttribute('src');
+        previewAudio.style.display = 'none';
+        setWorkshopVoiceSourceStatus(error?.message || t('voice.workshopSourceLoadFailed', 'Failed to load workshop reference voice'), true);
+        updateFileDisplay();
+    }
+}
+
+function setFormDisabled(disabled) {
+    const audioFile = document.getElementById('audioFile');
+    const directLinkUrl = document.getElementById('directLinkUrl');
+    const refLanguage = document.getElementById('refLanguage');
+    const prefix = document.getElementById('prefix');
+    const voiceProvider = document.getElementById('voiceProvider');
+    if (audioFile) audioFile.disabled = disabled;
+    if (directLinkUrl) directLinkUrl.disabled = disabled;
+    if (refLanguage) refLanguage.disabled = disabled;
+    if (prefix) prefix.disabled = disabled;
+    if (voiceProvider) voiceProvider.disabled = disabled;
+    // 禁用所有按钮
+    const buttons = document.querySelectorAll('button');
+    if (buttons && buttons.length > 0) {
+        buttons.forEach(btn => {
+            if (btn) btn.disabled = disabled;
+        });
+    }
+}
+
+function registerVoice() {
+    const fileInput = document.getElementById('audioFile');
+    const directLinkUrl = document.getElementById('directLinkUrl');
+    const refLanguage = document.getElementById('refLanguage').value;
+    const resultDiv = document.getElementById('result');
+    const effectiveAudioFile = getEffectiveAudioFile();
+    const provider = (document.getElementById('voiceProvider') || {}).value || 'cosyvoice';
+    const prefix = normalizePrefixInputForProvider();
+
+    // 清空现有内容并重置类名
+    resultDiv.textContent = '';
+    resultDiv.className = 'result';
+
+    // 根据克隆方式验证输入
+    if (currentCloneMethod === 'file') {
+        // 先检查文件
+        if (!effectiveAudioFile) {
+            resultDiv.textContent = window.t ? window.t('voice.pleaseUploadFile') : '请选择音频文件';
+            resultDiv.className = 'result error';
+            return;
+        }
+        // 再检查前缀
+        if (!prefix) {
+            resultDiv.textContent = window.t ? window.t('voice.pleaseEnterPrefix') : '请填写自定义前缀';
+            resultDiv.className = 'result error';
+            return;
+        }
+    } else {
+        // 直链克隆
+        const url = directLinkUrl.value.trim();
+        // 先检查URL
+        if (!url) {
+            resultDiv.textContent = window.t ? window.t('voice.pleaseEnterDirectLink') : '请输入音频直链URL';
+            resultDiv.className = 'result error';
+            return;
+        }
+        // 再检查前缀
+        if (!prefix) {
+            resultDiv.textContent = window.t ? window.t('voice.pleaseEnterPrefix') : '请填写自定义前缀';
+            resultDiv.className = 'result error';
+            return;
+        }
+        // 验证URL格式
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            resultDiv.textContent = window.t ? window.t('voice.invalidDirectLink') : '请输入有效的HTTP/HTTPS链接';
+            resultDiv.className = 'result error';
+            return;
+        }
+    }
+
+    setFormDisabled(true);
+    resultDiv.textContent = window.t ? window.t('voice.registering') : '正在注册声音，请稍后！';
+    resultDiv.className = 'result';
+
+    // 根据克隆方式选择API端点和参数
+    let requestOptions;
+    if (currentCloneMethod === 'file') {
+        // 本地文件克隆
+        const formData = new FormData();
+        formData.append('file', effectiveAudioFile, effectiveAudioFile.name);
+        formData.append('ref_language', refLanguage);
+        formData.append('prefix', prefix);
+        formData.append('provider', provider);
+        requestOptions = {
+            method: 'POST',
+            body: formData
+        };
+    } else {
+        // 直链克隆
+        requestOptions = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                direct_link: directLinkUrl.value.trim(),
+                ref_language: refLanguage,
+                prefix: prefix,
+                provider: provider
+            })
+        };
+    }
+
+    const apiUrl = currentCloneMethod === 'file'
+        ? '/api/characters/voice_clone'
+        : '/api/characters/voice_clone_direct';
+
+    fetch(apiUrl, requestOptions)
+        .then(async res => {
+            const { data, nonJson, text } = await safeReadResponse(res);
+            if (!res.ok) {
+                if (data) {
+                    // 从响应体中提取详细错误信息（优先已翻译的 errors.<code>，缺失则回退到 message/detail/error）
+                    throw new Error(resolveBackendErrorMsg(data, res.status));
+                }
+                // 后端/网关返回了 HTML（如 404/502/504），构造可读错误而不是 "Unexpected token '<'"
+                throw new Error(buildNonJsonError(res, text));
+            }
+            if (nonJson) {
+                // 状态码 2xx 但响应体不是 JSON——不应发生，但仍优雅处理
+                throw new Error(buildNonJsonError(res, text));
+            }
+            return data;
+        })
+        .then(data => {
+            if (data.voice_id) {
+                if (data.reused) {
+                    resultDiv.textContent = window.t ? window.t('voice.reusedExisting', { voiceId: data.voice_id }) : '已复用现有音色，跳过上传。voice_id: ' + data.voice_id;
+                } else if (data.local_save_failed) {
+                    // 部分成功：音色注册成功但本地保存失败
+                    resultDiv.innerHTML = '';
+                    const partialMsg = document.createElement('span');
+                    partialMsg.style.color = 'orange';
+                    partialMsg.textContent = window.t ? window.t('voice.registerSuccessButSaveFailed') : '音色注册成功，但本地保存失败';
+                    resultDiv.appendChild(partialMsg);
+                    resultDiv.appendChild(document.createElement('br'));
+                    
+                    const voiceIdLabel = document.createElement('span');
+                    voiceIdLabel.textContent = 'voice_id: ';
+                    resultDiv.appendChild(voiceIdLabel);
+                    
+                    const voiceIdCode = document.createElement('code');
+                    voiceIdCode.style.background = '#f0f0f0';
+                    voiceIdCode.style.padding = '2px 6px';
+                    voiceIdCode.style.borderRadius = '4px';
+                    voiceIdCode.style.userSelect = 'all';
+                    voiceIdCode.textContent = data.voice_id;
+                    resultDiv.appendChild(voiceIdCode);
+                    
+                    resultDiv.appendChild(document.createElement('br'));
+                    const copyHint = document.createElement('span');
+                    copyHint.style.fontSize = '12px';
+                    copyHint.style.color = '#666';
+                    copyHint.textContent = window.t ? window.t('voice.pleaseCopyVoiceId') : '请复制上面的voice_id手动保存';
+                    resultDiv.appendChild(copyHint);
+                    
+                    setFormDisabled(false);
+                    return;
+                } else {
+                    resultDiv.textContent = window.t ? window.t('voice.registerSuccess', { voiceId: data.voice_id }) : '注册成功！voice_id: ' + data.voice_id;
+                }
+                // 刷新音色列表
+                setTimeout(() => {
+                    if (typeof loadVoices === 'function') {
+                        loadVoices();
+                    }
+                }, 1000);
+                // 自动更新voice_id到后端
+                const lanlanName = document.getElementById('lanlan_name').value;
+                if (lanlanName) {
+                    saveVoiceIdToCurrentCharacter(data.voice_id).then(({ result: res }) => {
+                        const successMsg = document.createElement('span');
+                        successMsg.textContent = (window.t ? window.t('voice.voiceIdSaved') : 'voice_id已自动保存到角色');
+                        resultDiv.appendChild(document.createElement('br'));
+                        resultDiv.appendChild(successMsg);
+
+                        // 如果session被结束，页面会自动刷新
+                        const statusSpan = document.createElement('span');
+                        statusSpan.style.color = 'blue';
+                        if (res.session_restarted) {
+                            statusSpan.textContent = (window.t ? window.t('voice.pageWillRefresh') : '当前页面即将自动刷新以应用新语音');
+                        } else {
+                            statusSpan.textContent = (window.t ? window.t('voice.voiceWillTakeEffect') : '新语音将在下次对话时生效');
+                        }
+                        resultDiv.appendChild(document.createElement('br'));
+                        resultDiv.appendChild(statusSpan);
+                    }).catch(e => {
+                        // e 可能携带 safeReadResponse/buildNonJsonError 构造的可读错误
+                        // （含 HTTP 状态和正文摘要），必须拼进最终提示，否则诊断信息被吞。
+                        const saveErrorMsg = e?.message || e?.toString() || (window.t ? window.t('common.unknownError') : '未知错误');
+                        const base = window.t ? window.t('voice.voiceIdSaveRequestError') : 'voice_id自动保存请求出错';
+                        const errorSpan = document.createElement('span');
+                        errorSpan.className = 'error';
+                        errorSpan.textContent = saveErrorMsg ? `${base}: ${saveErrorMsg}` : base;
+                        resultDiv.appendChild(document.createElement('br'));
+                        resultDiv.appendChild(errorSpan);
+                    });
+                }
+            } else {
+                const errorObj = data.error || (window.t ? window.t('common.unknownError') : '未知错误');
+                const { displayError, shouldFlash } = parseVoiceRegisterError(errorObj);
+                resultDiv.textContent = window.t ? window.t('voice.registerFailed', { error: displayError }) : '注册失败：' + displayError;
+                resultDiv.className = 'result error';
+                if (shouldFlash) {
+                    resultDiv.classList.add('error-flash');
+                }
+            }
+            setFormDisabled(false);
+        })
+        .catch(err => {
+            const errorObj = err?.message || err?.toString() || (window.t ? window.t('common.unknownError') : '未知错误');
+            const { displayError, shouldFlash } = parseVoiceRegisterError(errorObj);
+            resultDiv.textContent = window.t ? window.t('voice.requestError', { error: displayError }) : '请求出错：' + displayError;
+            resultDiv.className = 'result error';
+            if (shouldFlash) {
+                resultDiv.classList.add('error-flash');
+            }
+            setFormDisabled(false);
+        });
+}
+
+// 监听API Key变更事件
+window.addEventListener('message', function (event) {
+    if (!ALLOWED_ORIGINS.includes(event.origin)) return;
+    if (event.data.type === 'api_key_changed') {
+        // API Key已更改，可以在这里添加其他需要的处理逻辑
+        console.log('API Key已更改，音色注册页面已收到通知');
+        // 刷新音色列表
+        loadVoices();
+    }
+});
+
+async function playPreview(voiceId, btn) {
+    if (btn.disabled) return;
+
+    const originalContent = btn.innerHTML;
+    const loadingText = window.t ? window.t('voice.loading') : '...';
+    btn.textContent = loadingText;
+    btn.disabled = true;
+
+    try {
+        const storageKey = `voice_preview_${voiceId}`;
+        let audioSrc = localStorage.getItem(storageKey);
+
+        if (!audioSrc) {
+            // 如果本地没有缓存，则从服务器获取
+            const response = await fetch(`/api/characters/voice_preview?voice_id=${encodeURIComponent(voiceId)}`);
+            const { data, nonJson, text } = await safeReadResponse(response);
+            if (!response.ok) {
+                if (data && (data.error || data.detail)) {
+                    throw new Error(data.error || data.detail);
+                }
+                throw new Error(buildNonJsonError(response, text));
+            }
+            if (nonJson) {
+                throw new Error(buildNonJsonError(response, text));
+            }
+
+            if (data.success && data.audio) {
+                audioSrc = `data:${data.mime_type || 'audio/mpeg'};base64,${data.audio}`;
+                // 保存到 localStorage
+                try {
+                    localStorage.setItem(storageKey, audioSrc);
+                } catch (e) {
+                    console.warn('Failed to save preview to localStorage:', e);
+                    // localStorage 可能满了，但我们仍然可以播放这一次生成的音频
+                }
+            } else {
+                const _errMsg = resolveBackendErrorMsg(data, response.status) || 'Failed to get preview';
+                throw new Error(_errMsg);
+            }
+        }
+
+        if (audioSrc) {
+            const audio = new Audio(audioSrc);
+            audio.play().catch(e => {
+                console.error('Audio play error:', e);
+                alert(window.t ? window.t('voice.playFailed', { error: e.message }) : '播放失败: ' + e.message);
+            });
+            btn.innerHTML = originalContent;
+            btn.disabled = false;
+        }
+    } catch (error) {
+        console.error('Preview error:', error);
+        const errorMsg = error?.message || error?.toString();
+        alert(window.t ? window.t('voice.previewFailed', { error: errorMsg }) : '预览失败: ' + errorMsg);
+        btn.innerHTML = originalContent;
+        btn.disabled = false;
+    }
+}
+
+// 加载音色列表
+async function loadVoices() {
+    const container = document.getElementById('voice-list-container');
+    const refreshBtn = document.getElementById('refresh-voices-btn');
+
+    if (!container) return;
+
+    // 显示加载状态
+    const loadingText = window.t ? window.t('voice.loading') : '加载中...';
+    container.textContent = '';
+    const loadingDiv = document.createElement('div');
+    loadingDiv.style.textAlign = 'center';
+    loadingDiv.style.color = '#999';
+    loadingDiv.style.padding = '20px';
+    loadingDiv.id = 'voice-list-loading';
+    const loadingSpan = document.createElement('span');
+    loadingSpan.textContent = loadingText;
+    loadingDiv.appendChild(loadingSpan);
+    container.appendChild(loadingDiv);
+
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    try {
+        const currentVoiceId = await getCurrentCharacterVoiceId().catch(error => {
+            console.warn('获取当前角色音色失败:', error);
+            return '';
+        });
+        const response = await fetch('/api/characters/voices');
+        const { data, nonJson, text } = await safeReadResponse(response);
+        if (!response.ok) {
+            if (data && (data.error || data.detail)) {
+                throw new Error(data.error || data.detail);
+            }
+            throw new Error(buildNonJsonError(response, text));
+        }
+        if (nonJson) {
+            throw new Error(buildNonJsonError(response, text));
+        }
+
+        if ((!data.voices || Object.keys(data.voices).length === 0) &&
+            (!data.free_voices || Object.keys(data.free_voices).length === 0)) {
+            const noVoicesText = window.t ? window.t('voice.noVoices') : '暂无已注册音色';
+            container.textContent = '';
+            const emptyDiv = document.createElement('div');
+            emptyDiv.className = 'voice-list-empty';
+            const emptySpan = document.createElement('span');
+            emptySpan.textContent = noVoicesText;
+            emptyDiv.appendChild(emptySpan);
+            container.appendChild(emptyDiv);
+            return;
+        }
+
+        // 清空容器
+        container.textContent = '';
+
+        // 按创建时间排序（如果有）
+        const voicesArray = Object.entries(data.voices).map(([voiceId, voiceData]) => ({
+            voiceId,
+            ...voiceData
+        }));
+
+        // 如果有创建时间，按时间倒序排列
+        voicesArray.sort((a, b) => {
+            if (a.created_at && b.created_at) {
+                return new Date(b.created_at) - new Date(a.created_at);
+            }
+            return 0;
+        });
+
+        // 创建音色列表项
+        voicesArray.forEach(({ voiceId, prefix, created_at }) => {
+            const item = document.createElement('div');
+            item.className = 'voice-list-item';
+            item.dataset.voiceId = voiceId;
+            item.tabIndex = 0;
+            item.setAttribute('role', 'button');
+            item.setAttribute('aria-label', window.t ? window.t('voice.applyVoiceAria', { name: prefix || voiceId }) : `应用音色 ${prefix || voiceId}`);
+            markSelectedVoiceItem(item, voiceId === currentVoiceId);
+
+            const voiceName = prefix || voiceId;
+            const displayName = voiceName.length > 30 ? voiceName.substring(0, 30) + '...' : voiceName;
+
+            let dateStr = '';
+            if (created_at) {
+                try {
+                    const date = new Date(created_at);
+                    // 使用 i18n locale，回退到 navigator.language，最后回退到 'en-US'
+                    const locale = (window.i18n && window.i18n.language) || navigator.language || 'en-US';
+                    dateStr = date.toLocaleString(locale, {
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                } catch (e) {
+                    // 忽略日期解析错误
+                }
+            }
+
+            const voiceActions = document.createElement('div');
+            voiceActions.className = 'voice-actions';
+
+            const previewBtn = document.createElement('button');
+            previewBtn.className = 'voice-preview-btn';
+            const previewText = window.t ? window.t('voice.preview') : '预览';
+            const previewImg = document.createElement('img');
+            previewImg.src = '/static/icons/sound.png';
+            previewImg.alt = '';
+            previewBtn.appendChild(previewImg);
+            previewBtn.appendChild(document.createTextNode(previewText));
+            previewBtn.onclick = (event) => {
+                event.stopPropagation();
+                playPreview(voiceId, previewBtn);
+            };
+
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'voice-delete-btn';
+            const deleteText = window.t ? window.t('voice.delete') : '删除';
+            const deleteImg = document.createElement('img');
+            deleteImg.src = '/static/icons/delete.png';
+            deleteImg.alt = '';
+            deleteBtn.appendChild(deleteImg);
+            deleteBtn.appendChild(document.createTextNode(deleteText));
+            deleteBtn.onclick = (event) => {
+                event.stopPropagation();
+                deleteVoice(voiceId, displayName);
+            };
+
+            voiceActions.appendChild(previewBtn);
+            voiceActions.appendChild(deleteBtn);
+
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'voice-info';
+
+            const nameDiv = document.createElement('div');
+            nameDiv.className = 'voice-name';
+            nameDiv.textContent = displayName;
+            infoDiv.appendChild(nameDiv);
+
+            const idDiv = document.createElement('div');
+            idDiv.className = 'voice-id';
+            idDiv.textContent = `ID: ${voiceId}`;
+            infoDiv.appendChild(idDiv);
+
+            if (dateStr) {
+                const dateDiv = document.createElement('div');
+                dateDiv.className = 'voice-date';
+                dateDiv.textContent = dateStr;
+                infoDiv.appendChild(dateDiv);
+            }
+
+            item.appendChild(infoDiv);
+            item.appendChild(voiceActions);
+            item.addEventListener('click', () => applyVoiceToCurrentCharacter(voiceId, displayName, item));
+            item.addEventListener('keydown', (event) => {
+                if (event.target !== item) return;
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    applyVoiceToCurrentCharacter(voiceId, displayName, item);
+                }
+            });
+
+            container.appendChild(item);
+        });
+
+        // 渲染免费预设音色（不可删除，放在最后）
+        if (data.free_voices && Object.keys(data.free_voices).length > 0) {
+            // 用户注册音色与预设音色之间的分隔线
+            if (voicesArray.length > 0) {
+                const divider = document.createElement('div');
+                divider.style.cssText = 'border-top: 1px dashed #b0d4f1; margin: 12px 0; padding-top: 8px; color: #90b8d8; font-size: 12px; text-align: center;';
+                const freeLabel = window.t ? window.t('voice.freePresetLabel') : '免费预设音色';
+                divider.textContent = '── ' + freeLabel + ' ──';
+                container.appendChild(divider);
+            }
+
+            Object.entries(data.free_voices).forEach(([voiceKey, voiceId]) => {
+                const item = document.createElement('div');
+                item.className = 'voice-list-item';
+                item.dataset.voiceId = voiceId;
+                item.style.opacity = '0.85';
+                item.tabIndex = 0;
+                item.setAttribute('role', 'button');
+                markSelectedVoiceItem(item, voiceId === currentVoiceId);
+
+                const infoDiv = document.createElement('div');
+                infoDiv.className = 'voice-info';
+
+                const nameDiv = document.createElement('div');
+                nameDiv.className = 'voice-name';
+                // 使用 i18n 翻译键获取显示名称
+                const displayName = window.t ? window.t(`voice.freeVoice.${voiceKey}`) : voiceKey;
+                nameDiv.textContent = displayName;
+                // 添加预设标签
+                const badge = document.createElement('span');
+                badge.style.cssText = 'margin-left: 8px; font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(100,180,255,0.25); color: #7ac4ff;';
+                badge.textContent = window.t ? window.t('voice.freePresetBadge') : '预设';
+                nameDiv.appendChild(badge);
+                infoDiv.appendChild(nameDiv);
+
+                const idDiv = document.createElement('div');
+                idDiv.className = 'voice-id';
+                idDiv.textContent = `ID: ${voiceId}`;
+                infoDiv.appendChild(idDiv);
+
+                item.appendChild(infoDiv);
+                item.setAttribute('aria-label', window.t ? window.t('voice.applyVoiceAria', { name: displayName }) : `应用音色 ${displayName}`);
+                item.addEventListener('click', () => applyVoiceToCurrentCharacter(voiceId, displayName, item));
+                item.addEventListener('keydown', (event) => {
+                    if (event.target !== item) return;
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        applyVoiceToCurrentCharacter(voiceId, displayName, item);
+                    }
+                });
+
+                // 免费预设音色：不支持预览和删除，但支持点击应用到当前角色
+
+                container.appendChild(item);
+            });
+        }
+
+    } catch (error) {
+        console.error('加载音色列表失败:', error);
+        const loadErrorText = window.t ? window.t('voice.loadError') : '加载失败，请稍后重试';
+        container.textContent = '';
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'voice-list-empty';
+        errorDiv.style.color = '#f44336';
+        const errorSpan = document.createElement('span');
+        errorSpan.textContent = loadErrorText;
+        errorDiv.appendChild(errorSpan);
+        container.appendChild(errorDiv);
+    } finally {
+        if (refreshBtn) refreshBtn.disabled = false;
+    }
+}
+
+// 删除音色
+async function deleteVoice(voiceId, voiceName) {
+    const confirmMsg = window.t
+        ? window.t('voice.confirmDelete', { name: voiceName })
+        : `确定要删除音色"${voiceName}"吗？此操作不可恢复。`;
+
+    if (!confirm(confirmMsg)) {
+        return;
+    }
+
+    const container = document.getElementById('voice-list-container');
+    const refreshBtn = document.getElementById('refresh-voices-btn');
+
+    if (!container) return;
+
+    // 禁用刷新按钮
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    // 显示删除中状态
+    container.textContent = '';
+    const deletingDiv = document.createElement('div');
+    deletingDiv.style.textAlign = 'center';
+    deletingDiv.style.color = '#999';
+    deletingDiv.style.padding = '20px';
+    const deletingSpan = document.createElement('span');
+    deletingSpan.textContent = window.t ? window.t('voice.deleting') : '删除中...';
+    deletingDiv.appendChild(deletingSpan);
+    container.appendChild(deletingDiv);
+
+    try {
+        const response = await fetch(`/api/characters/voices/${encodeURIComponent(voiceId)}`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const { data: parsed, nonJson, text } = await safeReadResponse(response);
+        if (!response.ok && !parsed) {
+            // 后端/网关返回了 HTML（如 404/502），抛出可读错误
+            throw new Error(buildNonJsonError(response, text));
+        }
+        if (nonJson) {
+            throw new Error(buildNonJsonError(response, text));
+        }
+        const data = parsed || {};
+
+        if (response.ok && data.success) {
+            // 删除本地缓存的预览音频
+            localStorage.removeItem(`voice_preview_${voiceId}`);
+            
+            // 删除成功，刷新列表
+            await loadVoices();
+            // 显示成功消息
+            const resultDiv = document.getElementById('result');
+            if (resultDiv) {
+                resultDiv.textContent = window.t
+                    ? window.t('voice.deleteSuccess', { name: voiceName })
+                    : `音色"${voiceName}"已成功删除`;
+                resultDiv.className = 'result';
+                // 3秒后清除消息
+                setTimeout(() => {
+                    resultDiv.textContent = '';
+                }, 3000);
+            }
+        } else {
+            // 删除失败，重新加载列表以恢复事件处理器
+            const errorMsg = data.error || (window.t ? window.t('voice.deleteFailed') : '删除失败');
+            alert(errorMsg);
+            await loadVoices();
+        }
+    } catch (error) {
+        console.error('删除音色失败:', error);
+        const errorMsg = window.t
+            ? window.t('voice.deleteError', { error: error.message })
+            : `删除失败: ${error.message}`;
+        alert(errorMsg);
+        // 重新加载列表以恢复事件处理器
+        await loadVoices();
+    } finally {
+        if (refreshBtn) refreshBtn.disabled = false;
+    }
+}
+
+// 页面加载时自动加载音色列表
+(async function initVoiceList() {
+    // 等待 i18n 初始化完成
+    const waitForI18n = () => {
+        if (window.i18n && window.i18n.isInitialized && typeof window.t === 'function') {
+            // 确保页面文本已更新
+            if (typeof window.updatePageTexts === 'function') {
+                window.updatePageTexts();
+            }
+            // 等待页面完全加载后再加载音色列表
+            setTimeout(loadVoices, 500);
+        } else {
+            // 继续等待
+            setTimeout(waitForI18n, 100);
+        }
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', waitForI18n);
+    } else {
+        waitForI18n();
+    }
+})();

@@ -1,0 +1,2246 @@
+@import 'katex/dist/katex.min.css';
+
+:root {
+  --neko-chat-tool-cursor: auto;
+  color: #1f2329;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 320px;
+}
+
+html.neko-tool-cursor-active,
+html.neko-tool-cursor-active *,
+html.neko-tool-cursor-active *::before,
+html.neko-tool-cursor-active *::after {
+  cursor: var(--neko-chat-tool-cursor) !important;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+button,
+[role="button"] {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+button * {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+img,
+svg {
+  -webkit-user-drag: none;
+  -khtml-user-drag: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+
+.app-shell {
+  width: 100%;
+  height: 100%;
+}
+
+.avatar-cursor-overlay {
+  --avatar-cursor-overlay-scale: 1;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 9998;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.avatar-cursor-overlay.is-compact {
+  --avatar-cursor-overlay-scale: 0.56;
+}
+
+.avatar-cursor-overlay-stage {
+  opacity: 0;
+  transform: scale(calc(var(--avatar-cursor-overlay-scale) * 0.84));
+  will-change: transform, opacity;
+  transition:
+    opacity 180ms cubic-bezier(0.22, 0.78, 0.2, 1),
+    transform 180ms cubic-bezier(0.2, 0.82, 0.22, 1);
+}
+
+.avatar-cursor-overlay.is-visible .avatar-cursor-overlay-stage {
+  opacity: 1;
+  transform: scale(var(--avatar-cursor-overlay-scale));
+}
+
+.avatar-cursor-overlay-image {
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+  will-change: transform;
+}
+
+.avatar-cursor-overlay-image-lollipop {
+  width: 74px;
+  height: 108px;
+}
+
+.avatar-cursor-overlay-image-fist {
+  width: 100px;
+  height: 102px;
+}
+
+.fist-floating-drop {
+  --drop-drift-x: 0px;
+  --drop-drift-y: -96px;
+  --drop-rotation: 0deg;
+  --drop-scale: 1;
+  --drop-delay: 0ms;
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 1;
+  will-change: transform;
+  transform: translate3d(0, 0, 0);
+  animation: fist-drop-burst 0.92s cubic-bezier(0.16, 0.78, 0.22, 1) forwards;
+  animation-delay: var(--drop-delay);
+}
+
+.fist-floating-drop-image {
+  display: block;
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  transform: translate3d(0, 0, 0) rotate(var(--drop-rotation)) scale(calc(var(--drop-scale) * 0.72));
+  will-change: transform;
+  animation: fist-drop-spin 0.92s cubic-bezier(0.18, 0.72, 0.22, 1) forwards;
+  animation-delay: var(--drop-delay);
+  pointer-events: none;
+}
+
+@keyframes fist-drop-burst {
+  0% {
+    transform: translate3d(0, 6px, 0);
+  }
+
+  100% {
+    transform: translate3d(var(--drop-drift-x), var(--drop-drift-y), 0);
+  }
+}
+
+@keyframes fist-drop-spin {
+  0% {
+    transform: translate3d(0, 0, 0) rotate(calc(var(--drop-rotation) - 30deg)) scale(calc(var(--drop-scale) * 0.68));
+  }
+
+  18% {
+    transform: translate3d(0, -5px, 0) rotate(calc(var(--drop-rotation) + 48deg)) scale(calc(var(--drop-scale) * 1.06));
+  }
+
+  56% {
+    transform: translate3d(0, 0, 0) rotate(calc(var(--drop-rotation) + 142deg)) scale(calc(var(--drop-scale) * 1));
+  }
+
+  100% {
+    transform: translate3d(0, 0, 0) rotate(calc(var(--drop-rotation) + 212deg)) scale(calc(var(--drop-scale) * 0.84));
+  }
+}
+
+.lollipop-floating-heart {
+  --heart-drift-x: 0px;
+  --heart-drift-y: -96px;
+  --heart-sway-x: 10px;
+  --heart-scale: 1;
+  --heart-delay: 0ms;
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0;
+  will-change: transform, opacity;
+  transform: translate3d(0, 0, 0);
+  animation: lollipop-heart-rise 2.1s cubic-bezier(0.18, 0.72, 0.22, 1) forwards;
+  animation-delay: var(--heart-delay);
+}
+
+.lollipop-floating-heart-glyph {
+  display: block;
+  color: rgba(255, 126, 168, 0.92);
+  font-size: 22px;
+  line-height: 1;
+  text-shadow:
+    0 2px 10px rgba(255, 112, 155, 0.32),
+    0 0 14px rgba(255, 184, 204, 0.2);
+  transform: translate3d(0, 0, 0) scale(calc(var(--heart-scale) * 0.72));
+  will-change: transform;
+  animation: lollipop-heart-sway 2.1s ease-in-out forwards;
+  animation-delay: var(--heart-delay);
+}
+
+@keyframes lollipop-heart-rise {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, 10px, 0);
+  }
+
+  12% {
+    opacity: 1;
+  }
+
+  72% {
+    opacity: 0.9;
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--heart-drift-x), var(--heart-drift-y), 0);
+  }
+}
+
+@keyframes lollipop-heart-sway {
+  0% {
+    transform: translate3d(0, 0, 0) scale(calc(var(--heart-scale) * 0.52));
+  }
+
+  16% {
+    transform: translate3d(calc(var(--heart-sway-x) * 0.22), 0, 0) scale(calc(var(--heart-scale) * 0.86));
+  }
+
+  32% {
+    transform: translate3d(calc(var(--heart-sway-x) * -0.04), 0, 0) scale(calc(var(--heart-scale) * 0.98));
+  }
+
+  52% {
+    transform: translate3d(calc(var(--heart-sway-x) * 0.14), 0, 0) scale(calc(var(--heart-scale) * 1.03));
+  }
+
+  74% {
+    transform: translate3d(calc(var(--heart-sway-x) * -0.02), 0, 0) scale(calc(var(--heart-scale) * 1.08));
+  }
+
+  100% {
+    transform: translate3d(calc(var(--heart-sway-x) * 0.1), 0, 0) scale(calc(var(--heart-scale) * 1.12));
+  }
+}
+
+.hammer-cursor-overlay {
+  --hammer-overlay-scale: 1;
+  --hammer-overlay-anchor-fix-x: 0px;
+  --hammer-overlay-anchor-fix-y: 0px;
+  --hammer-overlay-visual-scale: 1;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 9999;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.hammer-cursor-overlay.is-compact {
+  --hammer-overlay-visual-scale: 0.52;
+}
+
+.hammer-cursor-overlay.is-easter-egg {
+  --hammer-overlay-scale: 5;
+  --hammer-overlay-anchor-fix-x: 322.11px;
+  --hammer-overlay-anchor-fix-y: 259.27px;
+}
+
+.hammer-cursor-overlay-stage {
+  opacity: 0;
+  transform: scale(calc(var(--hammer-overlay-visual-scale) * 0.82));
+  will-change: transform, opacity;
+  transition:
+    opacity 200ms cubic-bezier(0.22, 0.78, 0.2, 1),
+    transform 200ms cubic-bezier(0.2, 0.82, 0.22, 1);
+}
+
+.hammer-cursor-overlay.is-visible .hammer-cursor-overlay-stage {
+  opacity: 1;
+  transform: scale(var(--hammer-overlay-visual-scale));
+}
+
+.hammer-cursor-overlay-compact-image {
+  display: block;
+  width: 100px;
+  height: 96px;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+  filter: drop-shadow(0 4px 8px rgba(22, 34, 58, 0.16));
+}
+
+.hammer-cursor-overlay-visual {
+  position: relative;
+  width: 136px;
+  height: 130px;
+  will-change: transform, filter;
+  filter: drop-shadow(0 4px 8px rgba(22, 34, 58, 0.16));
+}
+
+.hammer-cursor-overlay-visual.is-idle {
+  transform: translate3d(var(--hammer-overlay-anchor-fix-x), var(--hammer-overlay-anchor-fix-y), 0) rotate(0deg) scale(var(--hammer-overlay-scale));
+}
+
+.hammer-cursor-overlay-visual.is-active {
+  animation: hammer-inner-cycle 620ms linear forwards;
+  filter: drop-shadow(0 13px 22px rgba(22, 34, 58, 0.3));
+}
+
+.hammer-cursor-overlay-visual.is-impact {
+  filter: drop-shadow(0 9px 18px rgba(22, 34, 58, 0.26));
+}
+
+.hammer-cursor-overlay-image {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+  will-change: opacity, transform;
+  transition: none;
+}
+
+.hammer-cursor-overlay-image-primary {
+  opacity: 1;
+}
+
+.hammer-cursor-overlay-image-secondary {
+  opacity: 0;
+  transform-origin: 80.19px 68px;
+  transform: translate3d(19.62px, -9.01px, 0) rotate(34.258deg) scale(0.999333);
+}
+
+.hammer-cursor-overlay-visual.is-impact .hammer-cursor-overlay-image-primary {
+  opacity: 0;
+}
+
+.hammer-cursor-overlay-visual.is-impact .hammer-cursor-overlay-image-secondary {
+  opacity: 1;
+}
+
+@keyframes hammer-inner-cycle {
+  0% {
+    transform: translate3d(var(--hammer-overlay-anchor-fix-x), var(--hammer-overlay-anchor-fix-y), 0) rotate(0deg) scale(var(--hammer-overlay-scale));
+  }
+
+  52% {
+    transform: translate3d(calc(var(--hammer-overlay-anchor-fix-x) + 18px), calc(var(--hammer-overlay-anchor-fix-y) - 12px), 0) rotate(42deg) scale(var(--hammer-overlay-scale));
+  }
+
+  66% {
+    transform: translate3d(calc(var(--hammer-overlay-anchor-fix-x) - 22px), calc(var(--hammer-overlay-anchor-fix-y) + 10px), 0) rotate(-86deg) scale(var(--hammer-overlay-scale));
+  }
+
+  81% {
+    transform: translate3d(calc(var(--hammer-overlay-anchor-fix-x) - 20px), calc(var(--hammer-overlay-anchor-fix-y) + 9px), 0) rotate(-82deg) scale(var(--hammer-overlay-scale));
+  }
+
+  90% {
+    transform: translate3d(calc(var(--hammer-overlay-anchor-fix-x) - 14px), calc(var(--hammer-overlay-anchor-fix-y) + 3px), 0) rotate(-58deg) scale(var(--hammer-overlay-scale));
+  }
+
+  96% {
+    transform: translate3d(calc(var(--hammer-overlay-anchor-fix-x) - 6px), calc(var(--hammer-overlay-anchor-fix-y) - 1px), 0) rotate(-18deg) scale(var(--hammer-overlay-scale));
+  }
+
+  100% {
+    transform: translate3d(var(--hammer-overlay-anchor-fix-x), var(--hammer-overlay-anchor-fix-y), 0) rotate(0deg) scale(var(--hammer-overlay-scale));
+  }
+}
+
+.chat-window {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  overflow: hidden;
+  background: transparent;
+}
+
+.window-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 10px 14px 8px;
+  position: relative;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(48px) saturate(180%);
+  -webkit-backdrop-filter: blur(48px) saturate(180%);
+  box-shadow:
+    inset 0 -0.5px 0 rgba(255, 255, 255, 0.25),
+    0 1px 4px rgba(100, 120, 160, 0.06);
+}
+
+.window-title-group {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.window-avatar,
+.avatar {
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.window-avatar {
+  width: 30px;
+  height: 30px;
+  color: #fff;
+  font-size: 0.92rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #3a72e8 0%, #6aa1ff 100%);
+}
+
+.window-avatar-image-shell {
+  background: transparent;
+}
+
+.window-avatar-image {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  image-rendering: -webkit-optimize-contrast;
+  image-rendering: crisp-edges;
+  pointer-events: none;
+}
+
+.window-title {
+  margin: 0;
+  font-size: 0.96rem;
+  font-weight: 700;
+  line-height: 1.2;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.window-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.topbar-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(68, 183, 254, 0.32);
+  border-radius: 999px;
+  background: rgba(68, 183, 254, 0.08);
+  color: #2497d9;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease, transform 0.18s ease;
+}
+
+.topbar-action-btn:hover {
+  background: rgba(68, 183, 254, 0.16);
+  border-color: rgba(68, 183, 254, 0.5);
+  color: #127dbc;
+  transform: translateY(-1px);
+}
+
+.topbar-action-btn:focus-visible {
+  outline: 2px solid rgba(68, 183, 254, 0.48);
+  outline-offset: 2px;
+}
+
+.topbar-action-btn.is-active {
+  background: rgba(68, 183, 254, 0.2);
+  border-color: rgba(68, 183, 254, 0.5);
+  color: #127dbc;
+}
+
+.topbar-action-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.topbar-action-label {
+  line-height: 1;
+}
+
+.icon-button,
+.tool-button {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.icon-button {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: #4e5f79;
+}
+
+.icon-button:hover,
+.tool-button:hover {
+  background: rgba(87, 110, 147, 0.12);
+}
+
+.chat-body {
+  min-height: 0;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.91);
+  position: relative;
+}
+
+/* Jukebox button — floating at top-right of chat-body */
+.topbar-action-icon-img {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.message-list {
+  height: 100%;
+  overflow: auto;
+  padding: 50px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* 滚动条：细线 + 半透明，参考 Discord / Slack */
+  scrollbar-width: thin;
+  scrollbar-color: rgba(140, 152, 172, 0.25) transparent;
+}
+
+.message-list::-webkit-scrollbar {
+  width: 5px;
+}
+
+.message-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.message-list::-webkit-scrollbar-thumb {
+  background: rgba(140, 152, 172, 0.25);
+  border-radius: 3px;
+}
+
+.message-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(140, 152, 172, 0.45);
+}
+
+.message-empty-state {
+  margin: auto;
+  padding: 10px 14px;
+  border-radius: 999px;
+  color: #6f7d91;
+  background: rgba(131, 148, 175, 0.14);
+  font-size: 0.78rem;
+}
+
+.message-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* 消息气泡进场动效 */
+@keyframes slideFromLeft {
+  from { opacity: 0; transform: translateX(-14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes slideFromRight {
+  from { opacity: 0.5; transform: translateX(8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.message-row-user {
+  justify-content: flex-end;
+  animation: slideFromRight 0.15s ease-out both;
+}
+
+.message-row-assistant {
+  justify-content: flex-start;
+  animation: slideFromLeft 0.25s ease-out both;
+}
+
+.message-row[data-guide-message="true"] {
+  animation: none !important;
+}
+
+.message-row-user .avatar {
+  order: 2;
+}
+
+.message-row-user .message-stack {
+  align-items: flex-end;
+}
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.avatar-placeholder {
+  opacity: 0;
+}
+
+.avatar-image {
+  object-fit: cover;
+  overflow: hidden;
+}
+
+.avatar-assistant {
+  color: #fff;
+  background: linear-gradient(135deg, #46a0ff 0%, #2f69df 100%);
+}
+
+.avatar-user {
+  color: #1f2329;
+  background: linear-gradient(135deg, #e6edf8 0%, #d8e2f2 100%);
+}
+
+.avatar-tool {
+  color: #fff;
+  background: linear-gradient(135deg, #65748d 0%, #8798b6 100%);
+}
+
+.message-stack {
+  max-width: min(86%, 320px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #7e899a;
+  font-size: 0.72rem;
+}
+
+.message-author {
+  font-weight: 600;
+  color: #596579;
+}
+
+.message-bubble {
+  padding: 9px 11px;
+  border-radius: 8px 16px 16px 16px;
+  box-shadow: 0 5px 14px rgba(53, 72, 104, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.message-bubble-assistant {
+  background: #fff;
+  color: #273042;
+}
+
+.message-bubble-user {
+  border-radius: 16px 8px 16px 16px;
+  color: #142033;
+  background: linear-gradient(135deg, #b9d6ff 0%, #d4e7ff 100%);
+}
+
+.message-bubble-tool {
+  background: linear-gradient(180deg, #f8fafc 0%, #edf2f8 100%);
+  color: #2b3a50;
+}
+
+.message-bubble-system {
+  background: rgba(131, 148, 175, 0.14);
+  color: #607086;
+}
+
+.message-block {
+  min-width: 0;
+}
+
+/* 流式文字分块渐现 — 每批新文本整体淡入，参考 ChatGPT / Claude.ai */
+@keyframes textChunkReveal {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes bubbleFloat {
+  0%, 100% { transform: translateY(0) scale(var(--composer-icon-bubble-scale, 1)); }
+  50% { transform: translateY(-7px) scale(var(--composer-icon-bubble-scale, 1)); }
+}
+
+@keyframes bubblePopoverAppear {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(12px) scale(0.68);
+  }
+
+  70% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(-2px) scale(1.05);
+  }
+
+  100% {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+.text-chunk-reveal {
+  animation: textChunkReveal 0.18s ease-out both;
+}
+
+.message-row[data-guide-message="true"] .text-chunk-reveal {
+  animation: none !important;
+}
+
+.message-block-text {
+  white-space: pre-wrap;
+}
+
+.message-block-markdown {
+  min-width: 0;
+  font-size: 0.94rem;
+  line-height: 1.58;
+}
+
+.message-block-markdown> :first-child {
+  margin-top: 0;
+}
+
+.message-block-markdown> :last-child {
+  margin-bottom: 0;
+}
+
+.message-block-markdown p,
+.message-block-markdown ul,
+.message-block-markdown ol,
+.message-block-markdown blockquote,
+.message-block-markdown pre,
+.message-block-markdown table,
+.message-block-markdown hr {
+  margin: 0 0 0.72rem;
+}
+
+.message-block-markdown h1,
+.message-block-markdown h2,
+.message-block-markdown h3,
+.message-block-markdown h4,
+.message-block-markdown h5,
+.message-block-markdown h6 {
+  margin: 0 0 0.58rem;
+  line-height: 1.3;
+  color: #1f2c42;
+}
+
+.message-block-markdown h1 {
+  font-size: 1.14rem;
+}
+
+.message-block-markdown h2 {
+  font-size: 1.06rem;
+}
+
+.message-block-markdown h3,
+.message-block-markdown h4,
+.message-block-markdown h5,
+.message-block-markdown h6 {
+  font-size: 0.98rem;
+}
+
+.message-block-markdown ul,
+.message-block-markdown ol {
+  padding-left: 1.2rem;
+}
+
+.message-block-markdown li+li {
+  margin-top: 0.22rem;
+}
+
+.message-block-markdown blockquote {
+  padding: 0.2rem 0 0.2rem 0.85rem;
+  border-left: 3px solid rgba(79, 115, 176, 0.28);
+  color: #55657d;
+}
+
+.message-block-markdown a {
+  color: #2f68df;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+
+.message-markdown-inline-code,
+.message-block-markdown :not(pre)>code {
+  padding: 0.12rem 0.35rem;
+  border-radius: 6px;
+  background: rgba(91, 111, 145, 0.12);
+  color: #22324d;
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+  font-size: 0.84em;
+}
+
+.message-code-block {
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid rgba(107, 125, 154, 0.16);
+  background: linear-gradient(180deg, rgba(241, 245, 251, 0.98), rgba(233, 238, 247, 0.98));
+}
+
+.message-code-language {
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid rgba(107, 125, 154, 0.14);
+  color: #607086;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.message-markdown-pre {
+  margin: 0;
+  padding: 0.8rem 0.9rem;
+  overflow: auto;
+  color: #1f2c42;
+  font-family: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
+  font-size: 0.8rem;
+  line-height: 1.55;
+}
+
+.message-markdown-pre code {
+  display: block;
+  min-width: max-content;
+  background: transparent;
+}
+
+.message-block-markdown table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.message-block-markdown th,
+.message-block-markdown td {
+  padding: 0.42rem 0.58rem;
+  border: 1px solid rgba(111, 129, 158, 0.16);
+  text-align: left;
+  vertical-align: top;
+}
+
+.message-block-markdown th {
+  color: #233147;
+  font-weight: 700;
+  background: rgba(238, 243, 251, 0.92);
+}
+
+.message-block-markdown hr {
+  border: 0;
+  border-top: 1px solid rgba(111, 129, 158, 0.18);
+}
+
+.message-block-markdown .katex {
+  font-size: 1.02em;
+}
+
+.message-block-markdown .katex-display {
+  margin: 0.85rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.18rem 0.08rem;
+}
+
+.message-block-image {
+  margin: 0;
+  max-width: 280px;
+  overflow: hidden;
+  border-radius: 12px;
+  background: rgba(220, 228, 240, 0.85);
+}
+
+.message-block-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.message-block-link {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  min-width: 220px;
+  padding: 10px;
+  border-radius: 12px;
+  color: inherit;
+  text-decoration: none;
+  background: rgba(248, 250, 252, 0.85);
+  border: 1px solid rgba(123, 139, 166, 0.15);
+}
+
+.message-link-thumb {
+  overflow: hidden;
+  border-radius: 10px;
+  background: rgba(220, 228, 240, 0.9);
+}
+
+.message-link-thumb img {
+  display: block;
+  width: 100%;
+  height: 132px;
+  object-fit: cover;
+}
+
+.message-link-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.message-link-title {
+  font-weight: 700;
+  color: #233147;
+}
+
+.message-link-description {
+  color: #64748b;
+  font-size: 0.82rem;
+}
+
+.message-link-url {
+  color: #4e6ea8;
+  font-size: 0.78rem;
+}
+
+.message-block-status {
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 0.78rem;
+}
+
+.message-block-status.tone-info {
+  color: #28589d;
+  background: rgba(70, 129, 227, 0.12);
+}
+
+.message-block-status.tone-success {
+  color: #236845;
+  background: rgba(48, 161, 100, 0.12);
+}
+
+.message-block-status.tone-warning {
+  color: #9a6008;
+  background: rgba(235, 168, 52, 0.16);
+}
+
+.message-block-status.tone-error {
+  color: #a63a3a;
+  background: rgba(223, 91, 91, 0.14);
+}
+
+.message-block-buttons,
+.message-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.message-action-button {
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: filter 120ms ease, background 120ms ease;
+}
+
+.message-action-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.message-action-button.variant-primary {
+  color: #fff;
+  background: linear-gradient(135deg, #2f68df 0%, #4a89ff 100%);
+}
+
+.message-action-button.variant-secondary {
+  color: #29405f;
+  background: rgba(104, 127, 165, 0.14);
+}
+
+.message-action-button.variant-danger {
+  color: #9f3030;
+  background: rgba(223, 91, 91, 0.14);
+}
+
+.message-action-button:hover:not(:disabled) {
+  filter: brightness(1.04);
+}
+
+.message-delivery {
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #2c65d4;
+  background: rgba(44, 101, 212, 0.1);
+  font-size: 0.72rem;
+}
+
+.message-delivery-failed {
+  color: #a63a3a;
+  background: rgba(223, 91, 91, 0.12);
+}
+
+.message-row-system {
+  justify-content: center;
+}
+
+.system-chip {
+  max-width: min(82%, 640px);
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  color: #607086;
+  background: rgba(131, 148, 175, 0.14);
+}
+
+.system-chip-time {
+  color: #7f8ca0;
+}
+
+.system-chip-content {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.system-chip .message-block {
+  min-width: auto;
+}
+
+.system-chip .message-block-text {
+  white-space: normal;
+}
+
+.composer-panel {
+  display: grid;
+  /* 显式 1 列、min 边为 0：阻断 grid item 默认 min-width: auto 把内部
+     nowrap 文本的 min-content 一路向上撑宽（galgame 选项过长时会让整个
+     panel 抗拒收缩，进而被 chat-window overflow: hidden 截断）。 */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  padding: 6px;
+  position: relative;
+  z-index: 15;
+  background: rgba(255, 255, 255, 0.91);
+  min-width: 0;
+}
+
+/* Hide empty music-player-mount so it doesn't occupy a grid row */
+#music-player-mount:empty {
+  display: none;
+}
+
+.composer-attachments {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.composer-attachment-card {
+  position: relative;
+  width: 90px;
+  height: 90px;
+  margin: 0;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  overflow: visible;
+  border: 2px solid #d7dde6;
+  box-shadow: 0 4px 10px rgba(89, 108, 140, 0.08);
+  background: #fff;
+}
+
+.composer-attachment-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.composer-attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 999px;
+  color: #fff;
+  background: #dc3545;
+  cursor: pointer;
+  font-size: 0.92rem;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+/* ===== 输入框统一容器 ===== */
+.composer {
+  display: block;
+  /* 作为 .composer-panel 的 grid item，显式 min-width: 0
+     让窗口收缩时跟随 panel 一起收，而不被自身 min-content 卡住。 */
+  min-width: 0;
+}
+
+.composer-input-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 98px;
+  min-width: 0;
+  padding: 0 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.91);
+  border: 1.5px solid rgba(127, 144, 170, 0.25);
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.78),
+    0 4px 14px rgba(89, 108, 140, 0.05);
+}
+
+.composer-input-shell:focus-within {
+  border-color: rgba(64, 197, 241, 0.55);
+  background: rgba(255, 255, 255, 0.91);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    0 0 0 3px rgba(64, 197, 241, 0.14),
+    0 8px 18px rgba(89, 108, 140, 0.08);
+}
+
+.composer-input {
+  display: block;
+  width: 100%;
+  min-height: 66px;
+  max-height: 160px;
+  margin: 0;
+  resize: none !important;
+  overflow-y: auto;
+  scrollbar-width: none;
+  border: 0;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  color: #1f2329;
+  padding: 12px 0 10px;
+  line-height: 1.34;
+  vertical-align: top;
+  box-shadow: none !important;
+}
+
+.composer-input::-webkit-scrollbar {
+  display: none;
+}
+
+.composer-input::-webkit-resizer {
+  display: none;
+}
+
+.composer-input::placeholder {
+  color: rgba(102, 117, 141, 0.5);
+  font-size: 0.85em;
+  line-height: 1.34;
+}
+
+.composer-input:focus,
+.composer-input:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+/* ===== 底部工具栏 ===== */
+.composer-bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0 10px;
+}
+
+.composer-bottom-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.composer-tool-menu {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.composer-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.composer-tool-btn:hover {
+  background: rgba(68, 183, 254, 0.1);
+}
+
+.composer-emoji-btn.is-active {
+  background: rgba(68, 183, 254, 0.18);
+}
+
+.composer-tool-clear-btn {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.92);
+  border-radius: 999px;
+  background: #44b7fe;
+  color: #fff;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  box-shadow: 0 2px 6px rgba(35, 116, 190, 0.28);
+  transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.composer-tool-clear-btn:hover {
+  background: #229ceb;
+  transform: scale(1.08);
+  box-shadow: 0 3px 8px rgba(35, 116, 190, 0.34);
+}
+
+.composer-tool-clear-btn span {
+  transform: translateY(-0.5px);
+}
+
+.composer-tool-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer-tool-btn img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.composer-tool-divider {
+  color: rgba(127, 144, 170, 0.35);
+  font-size: 1rem;
+  line-height: 1;
+  user-select: none;
+  padding: 0 2px;
+}
+
+/* ===== Composer overflow ··· menu (compact 模式下右 4 按钮折叠) ===== */
+
+/* expanded 态下右 4 按钮容器：整体作为一个单位伸缩。
+   transform-origin 锁在左边——展开时右边缘向右拉开，
+   折叠时右边缘向左压回 ··· 所在的位置（视觉像窗帘从右往左拉到左边）。 */
+.composer-tools-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  transform-origin: left center;
+  animation: composerToolsExpand 0.28s cubic-bezier(0.2, 0.85, 0.2, 1.0) both;
+}
+
+/* 离场：scaleX 1 → 0 整体向左折叠。
+   关键：同时动画 width，让 layout 也跟着收缩，否则 transform 不影响布局，
+   发送按钮在动画期间会被原宽度的元素一直顶住直到动画结束。
+   --collapse-from-width 由 React 在 expanded → collapsing 切换瞬间写入。
+   .is-leaving 特异性比上面基础规则高，安全覆盖入场 keyframes。 */
+.composer-tools-right.is-leaving {
+  overflow: hidden;
+  animation: composerToolsCollapse 0.26s cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+
+@keyframes composerToolsExpand {
+  from {
+    opacity: 0;
+    transform: scaleX(0);
+  }
+  to {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+
+@keyframes composerToolsCollapse {
+  from {
+    opacity: 1;
+    width: var(--collapse-from-width, auto);
+    transform: scaleX(1);
+  }
+  to {
+    opacity: 0;
+    width: 0;
+    transform: scaleX(0);
+  }
+}
+
+.composer-overflow-menu {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  /* 切到 compact 时 ··· 按钮的入场动画 */
+  animation: composerOverflowBtnEnter 0.28s cubic-bezier(0.2, 0.85, 0.2, 1.1) both;
+}
+
+/* expanding 阶段 ··· 按钮的退场动画（特异性比基础规则高，覆盖入场 keyframes） */
+.composer-overflow-menu.is-leaving {
+  animation: composerOverflowBtnLeave 0.20s cubic-bezier(0.4, 0, 0.6, 1) both;
+}
+
+@keyframes composerOverflowBtnEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.5) rotate(-45deg);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.06) rotate(0);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) rotate(0);
+  }
+}
+
+@keyframes composerOverflowBtnLeave {
+  from {
+    opacity: 1;
+    transform: scale(1) rotate(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.5) rotate(45deg);
+  }
+}
+
+/* 用户偏好减少动画时跳过过渡 */
+@media (prefers-reduced-motion: reduce) {
+  .composer-tools-right,
+  .composer-tools-right > *,
+  .composer-tools-right.is-leaving,
+  .composer-tools-right.is-leaving > *,
+  .composer-overflow-menu,
+  .composer-overflow-menu.is-leaving,
+  .composer-overflow-popover,
+  .composer-galgame-options.is-loading .composer-galgame-option {
+    animation: none !important;
+  }
+}
+
+.composer-overflow-btn {
+  color: #4a6478;
+}
+
+.composer-overflow-btn svg {
+  width: 20px;
+  height: 20px;
+  pointer-events: none;
+}
+
+.composer-overflow-btn.is-active {
+  background: rgba(68, 183, 254, 0.18);
+}
+
+/* 折叠面板：从 ··· 按钮上方弹出（输入栏在底部，向下会出窗口）。
+   4 个按钮垂直堆叠，保持 32×32 尺寸，hover 区域不变。 */
+.composer-overflow-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px;
+  /* 0.85 而非 0.96：让 backdrop-filter blur 有可见底色可虚化，
+     真正出现毛玻璃效果而不是浪费一层合成开销喵～ */
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(127, 144, 170, 0.18);
+  border-radius: 12px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.12),
+    0 2px 6px rgba(0, 0, 0, 0.06);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: composerOverflowAppear 0.18s cubic-bezier(0.2, 0.9, 0.2, 1.05) both;
+  transform-origin: bottom right;
+}
+
+@keyframes composerOverflowAppear {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 折叠面板内的工具菜单包装（emoji 子弹窗仍向上弹出，不受影响） */
+.composer-overflow-popover .composer-tool-menu {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.composer-icon-popover {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 6px);
+  transform: translateX(-50%);
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  transform-origin: bottom center;
+  animation: bubblePopoverAppear 0.24s cubic-bezier(0.2, 0.9, 0.2, 1.15) both;
+}
+
+.composer-icon-button {
+  --composer-icon-bubble-scale: 1;
+  position: relative;
+  width: 46px;
+  height: 46px;
+  border: 0;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 30% 28%, rgba(255, 255, 255, 0.74) 0%, rgba(255, 255, 255, 0.58) 24%, rgba(236, 246, 255, 0.5) 72%, rgba(210, 232, 249, 0.42) 100%);
+  color: #12304f;
+  cursor: pointer;
+  font-size: 1.28rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  box-shadow:
+    0 10px 20px rgba(77, 122, 174, 0.2),
+    0 2px 6px rgba(113, 160, 212, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(6px);
+  animation: bubbleFloat 3.2s ease-in-out infinite;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+}
+
+.composer-icon-button::before,
+.composer-icon-button::after {
+  content: '';
+  position: absolute;
+  pointer-events: none;
+}
+
+.composer-icon-button::before {
+  top: 7px;
+  left: 9px;
+  width: 20px;
+  height: 12px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(255, 255, 255, 0.08) 100%);
+  transform: rotate(-18deg);
+  opacity: 0.92;
+}
+
+.composer-icon-button::after {
+  right: 8px;
+  bottom: 7px;
+  width: 18px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(135, 188, 231, 0.18);
+  filter: blur(3px);
+}
+
+.composer-icon-button-image {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  pointer-events: none;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.composer-icon-button:nth-child(1) {
+  top: 8px;
+  animation-delay: -0.45s;
+}
+
+.composer-icon-button:nth-child(2) {
+  top: -2px;
+  animation-delay: -1.2s;
+}
+
+.composer-icon-button:nth-child(3) {
+  top: 8px;
+  animation-delay: -0.8s;
+}
+
+.composer-icon-button:hover {
+  --composer-icon-bubble-scale: 1.14;
+  background:
+    radial-gradient(circle at 30% 28%, rgba(255, 255, 255, 0.8) 0%, rgba(255, 255, 255, 0.66) 24%, rgba(233, 246, 255, 0.6) 72%, rgba(212, 236, 255, 0.5) 100%);
+  box-shadow:
+    0 12px 24px rgba(77, 122, 174, 0.24),
+    0 3px 8px rgba(113, 160, 212, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
+}
+
+.composer-icon-button:active {
+  --composer-icon-bubble-scale: 1.08;
+}
+
+.composer-icon-button.is-active {
+  --composer-icon-bubble-scale: 1.12;
+  background:
+    radial-gradient(circle at 30% 28%, rgba(255, 255, 255, 0.84) 0%, rgba(255, 255, 255, 0.7) 22%, rgba(223, 241, 255, 0.66) 70%, rgba(200, 232, 255, 0.56) 100%);
+  box-shadow:
+    0 12px 24px rgba(63, 168, 235, 0.22),
+    0 3px 8px rgba(96, 177, 230, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98);
+}
+
+.composer-icon-button.is-active:hover {
+  --composer-icon-bubble-scale: 1.18;
+}
+
+/* ===== 翻译开关按钮 ===== */
+.composer-translate-btn {
+  position: relative;
+}
+
+.composer-translate-btn img {
+  opacity: 0.45;
+  transition: opacity 0.18s ease;
+}
+
+.composer-translate-btn:hover img {
+  opacity: 0.7;
+}
+
+.composer-translate-btn.is-active img {
+  opacity: 1;
+}
+
+.composer-translate-btn.is-active::after {
+  content: '';
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 16px;
+  height: 3px;
+  border-radius: 2px;
+  background: #2497d9;
+}
+
+/* ===== GalGame 模式开关 + 内嵌 A/B/C 选项 ===== */
+/* default/hover/active 三档对齐 .composer-translate-btn img 的 0.45 / 0.7 / 1
+   opacity 节奏；同色系，避免之前那个蓝灰冷灰看着像"未启用"的灰按钮。
+   border 从 1.5px 收到 1px，避免 active 时边框 + 700 字重双层勾画显得过重。 */
+.composer-galgame-btn {
+  position: relative;
+  color: rgba(36, 151, 217, 0.45);
+}
+
+.composer-galgame-btn-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.composer-galgame-btn:hover {
+  color: rgba(36, 151, 217, 0.78);
+}
+
+.composer-galgame-btn.is-active {
+  color: #2497d9;
+}
+
+.composer-galgame-btn.is-active::after {
+  content: '';
+  position: absolute;
+  bottom: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 16px;
+  height: 3px;
+  border-radius: 2px;
+  background: #2497d9;
+}
+
+/* Slot 包住选项区，开/关靠 max-height + opacity 过渡。
+   collapsed 态自然占 0 高，输入壳跟着内容回到原本的紧凑高度，
+   下边缘和 PR 之前一样贴合面板底；展开时 shell 跟着 slot 长高，
+   bottom-bar 锚在 panel 底不动，textarea 顶端被往上推 → 视觉
+   是从下往上拉开。 */
+.composer-galgame-slot {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: max-height 220ms cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 180ms ease;
+}
+
+.composer-galgame-slot.is-open {
+  /* 上限给到 3 个 30px 按钮 + 间距 + margin 余量；超出会被 overflow
+     裁掉，但实际内容只有 ~104px 用不到这么多。 */
+  max-height: 160px;
+  opacity: 1;
+}
+
+.composer-galgame-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0 2px;
+  /* 让选项列在窄窗口下能跟随 input-shell 收缩，而不被内部 nowrap 文本顶宽。 */
+  min-width: 0;
+}
+
+.composer-galgame-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  /* 关键：默认 min-width: auto 会让长文本沿 flex 链向上传染，把整个输入壳撑宽；
+     置 0 后按钮严格遵循 width:100%，长文本走下面的 ellipsis 路径。 */
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 144, 170, 0.22);
+  background: rgba(244, 248, 254, 0.78);
+  color: #1f2329;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+  min-height: 30px;
+}
+
+.composer-galgame-option:hover:not(:disabled) {
+  background: rgba(220, 236, 252, 0.92);
+  border-color: rgba(64, 197, 241, 0.55);
+}
+
+.composer-galgame-option:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.composer-galgame-option:disabled,
+.composer-galgame-option.is-placeholder {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.composer-galgame-option-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: #2497d9;
+  font-size: 0.9em;
+}
+
+.composer-galgame-option-text {
+  flex: 1 1 auto;
+  /* min-width: 0 是 ellipsis 在 flex row 里真正生效的前置条件，
+     否则 flex item 默认 min-width:auto = 内容固有宽度，永远不会被裁。 */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.9em;
+  line-height: 1.3;
+}
+
+.composer-galgame-options.is-loading .composer-galgame-option {
+  animation: composerGalgameLoadingPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes composerGalgameLoadingPulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 0.85; }
+}
+
+/* ===== 圆形发送按钮 ===== */
+.send-button-circle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.send-button-circle:hover {
+  transform: scale(1.08);
+}
+
+.send-button-circle:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.send-button-circle img {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+@media (max-width: 820px) {
+  .chat-window {
+    min-height: 100%;
+  }
+
+  .window-topbar {
+    padding: 8px 12px 6px;
+  }
+
+  .message-stack {
+    max-width: 84%;
+  }
+
+  .composer-panel {
+    padding: 6px;
+  }
+}
+
+/* ===================================================================
+   暗色模式
+   使用 [data-theme="dark"] 属性选择器，与 N.E.K.O.-PC 保持一致
+   =================================================================== */
+
+/* --- 全局 --- */
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: rgba(200, 210, 230, 0.18);
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(200, 210, 230, 0.32);
+}
+
+[data-theme="dark"] ::selection {
+  background: rgba(68, 183, 254, 0.4);
+}
+
+/* --- 窗口容器 --- */
+[data-theme="dark"] .chat-window {
+  background: transparent;
+}
+
+[data-theme="dark"] .window-topbar {
+  background:
+    linear-gradient(180deg,
+      rgba(50, 50, 72, 0.6) 0%,
+      rgba(38, 38, 58, 0.5) 100%);
+  border-bottom-color: rgba(255, 255, 255, 0.12);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -0.5px 0 rgba(255, 255, 255, 0.04),
+    0 1px 4px rgba(0, 0, 0, 0.15);
+}
+
+[data-theme="dark"] .window-topbar::before {
+  background:
+    linear-gradient(105deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.06) 35%,
+      rgba(255, 255, 255, 0) 50%,
+      rgba(140, 180, 255, 0.04) 70%,
+      rgba(255, 255, 255, 0) 100%);
+}
+
+[data-theme="dark"] .window-title {
+  color: #e8eaed;
+}
+
+[data-theme="dark"] .topbar-action-btn {
+  background: rgba(68, 183, 254, 0.1);
+  border-color: rgba(68, 183, 254, 0.25);
+  color: #6fc7ff;
+}
+
+[data-theme="dark"] .topbar-action-btn:hover {
+  background: rgba(68, 183, 254, 0.18);
+  border-color: rgba(68, 183, 254, 0.4);
+  color: #8ed4ff;
+}
+
+[data-theme="dark"] .topbar-action-btn.is-active {
+  background: rgba(68, 183, 254, 0.22);
+  border-color: rgba(68, 183, 254, 0.45);
+  color: #8ed4ff;
+}
+
+[data-theme="dark"] .icon-button {
+  color: #aab0bc;
+}
+
+[data-theme="dark"] .icon-button:hover,
+[data-theme="dark"] .tool-button:hover {
+  background: rgba(200, 210, 230, 0.12);
+}
+
+[data-theme="dark"] .chat-body {
+  background: rgba(28, 28, 46, 0.91);
+}
+
+/* --- 消息列表滚动条 --- */
+[data-theme="dark"] .message-list {
+  scrollbar-color: rgba(200, 210, 230, 0.15) transparent;
+}
+
+[data-theme="dark"] .message-list::-webkit-scrollbar-thumb {
+  background: rgba(200, 210, 230, 0.15);
+}
+
+[data-theme="dark"] .message-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(200, 210, 230, 0.3);
+}
+
+/* --- 消息列表 --- */
+[data-theme="dark"] .message-empty-state {
+  color: #9aa0ac;
+  background: rgba(80, 90, 110, 0.2);
+}
+
+/* --- 消息气泡 --- */
+[data-theme="dark"] .message-bubble-assistant {
+  background: #2d2d3c;
+  color: #e8eaed;
+}
+
+[data-theme="dark"] .message-bubble-user {
+  background: linear-gradient(135deg, #1a3a6e 0%, #264a8a 100%);
+  color: #d8e6ff;
+}
+
+[data-theme="dark"] .message-bubble-tool {
+  background: linear-gradient(180deg, #232330, #1e1e2a);
+  color: #b8bcc4;
+}
+
+[data-theme="dark"] .message-bubble-system {
+  background: rgba(80, 90, 110, 0.2);
+  color: #9aa0ac;
+}
+
+/* --- 消息元信息 --- */
+[data-theme="dark"] .message-meta {
+  color: #9aa0ac;
+}
+
+[data-theme="dark"] .message-author {
+  color: #b8bcc4;
+}
+
+/* --- 头像 --- */
+[data-theme="dark"] .avatar-user {
+  color: #d0dae8;
+  background: linear-gradient(135deg, #2a3a5a 0%, #344a6e 100%);
+}
+
+/* --- Markdown 标题 --- */
+[data-theme="dark"] .message-block-markdown h1,
+[data-theme="dark"] .message-block-markdown h2,
+[data-theme="dark"] .message-block-markdown h3,
+[data-theme="dark"] .message-block-markdown h4,
+[data-theme="dark"] .message-block-markdown h5,
+[data-theme="dark"] .message-block-markdown h6 {
+  color: #c8d0e0;
+}
+
+/* --- Markdown 引用 --- */
+[data-theme="dark"] .message-block-markdown blockquote {
+  border-left-color: rgba(100, 140, 200, 0.3);
+  color: #9aa0ac;
+}
+
+/* --- Markdown 链接 --- */
+[data-theme="dark"] .message-block-markdown a {
+  color: #6fa8ff;
+}
+
+/* --- 行内代码 --- */
+[data-theme="dark"] .message-markdown-inline-code,
+[data-theme="dark"] .message-block-markdown :not(pre)>code {
+  background: rgba(100, 120, 160, 0.18);
+  color: #c0cce0;
+}
+
+/* --- 代码块 --- */
+[data-theme="dark"] .message-code-block {
+  border-color: rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(25, 25, 38, 0.98), rgba(20, 20, 32, 0.98));
+}
+
+[data-theme="dark"] .message-code-language {
+  border-bottom-color: rgba(255, 255, 255, 0.06);
+  color: #9aa0ac;
+}
+
+[data-theme="dark"] .message-markdown-pre {
+  color: #c0cce0;
+}
+
+/* --- 表格 --- */
+[data-theme="dark"] .message-block-markdown th,
+[data-theme="dark"] .message-block-markdown td {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme="dark"] .message-block-markdown th {
+  color: #c0cce0;
+  background: rgba(40, 40, 55, 0.9);
+}
+
+/* --- 分隔线 --- */
+[data-theme="dark"] .message-block-markdown hr {
+  border-top-color: rgba(255, 255, 255, 0.1);
+}
+
+/* --- 链接卡片 --- */
+[data-theme="dark"] .message-block-link {
+  background: rgba(35, 35, 48, 0.85);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+[data-theme="dark"] .message-link-title {
+  color: #c8d0e0;
+}
+
+[data-theme="dark"] .message-link-description {
+  color: #9aa0ac;
+}
+
+[data-theme="dark"] .message-link-url {
+  color: #6fa8ff;
+}
+
+/* --- 图片块 --- */
+[data-theme="dark"] .message-block-image {
+  background: rgba(40, 44, 60, 0.85);
+}
+
+/* --- 状态块 --- */
+[data-theme="dark"] .message-block-status.tone-info {
+  color: #6fa8ff;
+  background: rgba(68, 130, 230, 0.15);
+}
+
+[data-theme="dark"] .message-block-status.tone-success {
+  color: #5ec790;
+  background: rgba(48, 161, 100, 0.15);
+}
+
+[data-theme="dark"] .message-block-status.tone-warning {
+  color: #e8b44a;
+  background: rgba(235, 168, 52, 0.15);
+}
+
+[data-theme="dark"] .message-block-status.tone-error {
+  color: #e07070;
+  background: rgba(223, 91, 91, 0.15);
+}
+
+/* --- 操作按钮 --- */
+[data-theme="dark"] .message-action-button.variant-secondary {
+  color: #b8c4d8;
+  background: rgba(100, 120, 160, 0.18);
+}
+
+[data-theme="dark"] .message-action-button.variant-danger {
+  color: #e07070;
+  background: rgba(223, 91, 91, 0.15);
+}
+
+/* --- 消息发送状态 --- */
+[data-theme="dark"] .message-delivery {
+  color: #6fa8ff;
+  background: rgba(68, 130, 230, 0.15);
+}
+
+[data-theme="dark"] .message-delivery-failed {
+  color: #e07070;
+  background: rgba(223, 91, 91, 0.15);
+}
+
+/* --- 系统芯片 --- */
+[data-theme="dark"] .system-chip {
+  color: #9aa0ac;
+  background: rgba(80, 90, 110, 0.2);
+}
+
+[data-theme="dark"] .system-chip-time {
+  color: #7a8494;
+}
+
+/* --- 输入区域 --- */
+[data-theme="dark"] .composer-panel {
+  background: rgba(28, 28, 46, 0.91);
+}
+
+[data-theme="dark"] .composer-attachment-card {
+  border-color: #444;
+  background: #2a2a3a;
+}
+
+[data-theme="dark"] .composer-tool-btn:hover {
+  background: rgba(68, 183, 254, 0.15);
+}
+
+[data-theme="dark"] .composer-emoji-btn.is-active {
+  background: rgba(68, 183, 254, 0.26);
+}
+
+[data-theme="dark"] .composer-tool-clear-btn {
+  border-color: rgba(28, 28, 46, 0.92);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.44);
+}
+
+[data-theme="dark"] .composer-tool-divider {
+  color: rgba(255, 255, 255, 0.15);
+}
+
+[data-theme="dark"] .composer-overflow-btn {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+[data-theme="dark"] .composer-overflow-btn.is-active {
+  background: rgba(68, 183, 254, 0.26);
+}
+
+[data-theme="dark"] .composer-overflow-popover {
+  /* 0.78 而非 0.96：与浅色模式对齐，base 规则的 backdrop-filter blur(12px)
+     是级联继承下来的，太高 alpha 会让 blur 看不见还白吃 GPU 合成开销喵。
+     色温也微调到 (38,38,58)，对齐 .chat-body / .composer-input-shell 的蓝灰调子，
+     避免纯灰底色和下方输入栏色温脱节。 */
+  background: rgba(38, 38, 58, 0.78);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.5),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+[data-theme="dark"] .composer-icon-popover {
+  background: transparent;
+}
+
+[data-theme="dark"] .composer-icon-button {
+  border: 0;
+  background:
+    radial-gradient(circle at 30% 28%, rgba(104, 127, 179, 0.56) 0%, rgba(79, 100, 146, 0.46) 22%, rgba(50, 61, 93, 0.52) 72%, rgba(35, 43, 66, 0.44) 100%);
+  color: #d8eaff;
+  box-shadow:
+    0 12px 26px rgba(0, 0, 0, 0.34),
+    0 2px 8px rgba(28, 59, 109, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+[data-theme="dark"] .composer-icon-button::before {
+  background: linear-gradient(180deg, rgba(233, 244, 255, 0.34) 0%, rgba(233, 244, 255, 0.02) 100%);
+}
+
+[data-theme="dark"] .composer-icon-button::after {
+  background: rgba(122, 184, 255, 0.16);
+}
+
+[data-theme="dark"] .composer-icon-button:hover {
+  background:
+    radial-gradient(circle at 30% 28%, rgba(118, 145, 203, 0.68) 0%, rgba(94, 118, 168, 0.58) 22%, rgba(61, 81, 126, 0.64) 72%, rgba(54, 71, 110, 0.58) 100%);
+}
+
+[data-theme="dark"] .composer-icon-button.is-active {
+  background:
+    radial-gradient(circle at 30% 28%, rgba(130, 166, 232, 0.72) 0%, rgba(101, 132, 191, 0.62) 22%, rgba(73, 98, 150, 0.68) 72%, rgba(62, 83, 130, 0.62) 100%);
+  box-shadow:
+    0 12px 26px rgba(11, 24, 47, 0.42),
+    0 2px 8px rgba(37, 86, 160, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+[data-theme="dark"] .composer-translate-btn.is-active::after {
+  background: #44b7fe;
+}
+
+[data-theme="dark"] .composer-galgame-btn {
+  color: rgba(68, 183, 254, 0.5);
+}
+
+[data-theme="dark"] .composer-galgame-btn:hover {
+  color: rgba(68, 183, 254, 0.82);
+}
+
+[data-theme="dark"] .composer-galgame-btn.is-active {
+  color: #44b7fe;
+}
+
+[data-theme="dark"] .composer-galgame-btn.is-active::after {
+  background: #44b7fe;
+}
+
+[data-theme="dark"] .composer-galgame-option {
+  background: rgba(54, 64, 90, 0.6);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #e8eaed;
+}
+
+[data-theme="dark"] .composer-galgame-option:hover:not(:disabled) {
+  background: rgba(72, 96, 142, 0.78);
+  border-color: rgba(64, 197, 241, 0.45);
+}
+
+[data-theme="dark"] .composer-galgame-option-label {
+  color: #44b7fe;
+}
+
+[data-theme="dark"] .composer-input-shell {
+  background: rgba(42, 42, 60, 0.85);
+  border-color: rgba(255, 255, 255, 0.08);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 4px 14px rgba(0, 0, 0, 0.15);
+}
+
+[data-theme="dark"] .composer-input-shell:focus-within {
+  border-color: rgba(64, 197, 241, 0.4);
+  background: rgba(48, 48, 74, 0.85);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 0 3px rgba(64, 197, 241, 0.1),
+    0 8px 18px rgba(0, 0, 0, 0.2);
+}
+
+[data-theme="dark"] .composer-input {
+  color: #e8eaed;
+}
+
+[data-theme="dark"] .composer-input::placeholder {
+  color: #9aa0ac;
+}
+
+[data-theme="dark"] .send-button-circle:hover {
+  opacity: 0.85;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar-cursor-overlay-stage,
+  .hammer-cursor-overlay-stage,
+  .fist-floating-drop,
+  .fist-floating-drop-image,
+  .lollipop-floating-heart,
+  .lollipop-floating-heart-glyph,
+  .hammer-cursor-overlay-visual.is-active,
+  .message-row-user,
+  .message-row-assistant,
+  .text-chunk-reveal,
+  .composer-icon-popover,
+  .composer-icon-button,
+  .composer-galgame-slot,
+  .composer-galgame-option {
+    animation: none !important;
+    animation-delay: 0ms !important;
+    transition: none !important;
+  }
+}
